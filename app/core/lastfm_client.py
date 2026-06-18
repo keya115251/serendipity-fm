@@ -1,3 +1,12 @@
+"""
+Thin async client for the Last.fm public API.
+
+Docs: https://www.last.fm/api
+
+All methods here use read-only public endpoints, so only an API key
+is required (no shared secret, no OAuth, no signed requests).
+"""
+
 import asyncio
 import httpx
 from app.core.config import settings
@@ -76,7 +85,7 @@ class LastFMClient:
             }
             for a in artists
         ]
-    
+
     async def get_top_tracks(self, username: str, period: str = "overall", limit: int = 50) -> list[dict]:
         """
         period: overall | 7day | 1month | 3month | 6month | 12month
@@ -154,7 +163,19 @@ class LastFMClient:
         ]
 
     async def get_artist_info(self, artist: str) -> dict:
-        """Returns basic info including global listener/playcount (used for popularity-inverse weighting)."""
+        """
+        Returns basic info including global listener/playcount (used for
+        popularity-inverse weighting) and mbid (MusicBrainz ID).
+
+        mbid is included specifically because real testing showed it's a
+        reliable signal for distinguishing legitimate catalogued artists
+        from one-off collaboration/compilation credits: e.g. "Hayley
+        Williams" (real solo discography) has a real MBID, while
+        "Selena Gomez, benny blanco & The Marías" (a multi-artist single
+        credit bundled as one Last.fm entry) has none. Used by
+        ArtistDataCache/DiscoveryWalk to filter these out of
+        recommendations - see app/core/discovery_walk.py.
+        """
         data = await self._call(
             "artist.getinfo",
             artist=artist,
@@ -166,4 +187,5 @@ class LastFMClient:
             "name": info.get("name", artist),
             "listeners": int(stats.get("listeners", 0)),
             "playcount": int(stats.get("playcount", 0)),
+            "mbid": info.get("mbid") or None,
         }

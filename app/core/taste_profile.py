@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 
 from app.core.lastfm_client import LastFMClient, LastFMError
 from app.core.artist_graph import ArtistGraphBuilder
+from app.core.tag_relevance import build_discounted_dominant_tags, score_relevance_against_dominant_tags
 
 
 @dataclass
@@ -85,42 +86,17 @@ class TasteProfileBuilder:
     ) -> dict[str, float]:
         """
         Returns each artist's tag-based relevance score (0-1) to the
-        profile's dominant taste, using a weight-magnitude dominant set
-        with a document-frequency discount on generic tags (see module
-        docstring history / README for why this replaced a simpler
-        rank-percentage cutoff and a raw-overlap-fraction score).
-
-        This now returns scores rather than a final outlier list, because
-        the actual outlier decision is made by combining this signal with
-        graph connectivity in _combine_outlier_signals - tag relevance
-        alone proved unreliable (a single generic tag like "rock" could
-        rescue an artist that should have been flagged).
+        profile's dominant taste. Delegates the actual dominant-set
+        construction and discounting to app.core.tag_relevance, which is
+        shared with DiscoveryWalk so both modules use the identical,
+        validated logic rather than diverging copies (see that module's
+        docstring for why the discount exists).
         """
-        if not tag_weights:
-            return {a: 0.0 for a in artist_tags}
-
-        max_weight = max(tag_weights.values())
-        dominant_tags = {t: w for t, w in tag_weights.items() if w >= max_weight * weight_score_threshold}
-
-        total_artists = len(artist_tags)
-        doc_freq = {
-            tag: sum(1 for tags in artist_tags.values() if tag in tags)
-            for tag in dominant_tags
+        discounted_dominant = build_discounted_dominant_tags(tag_weights, artist_tags, weight_score_threshold)
+        return {
+            artist: score_relevance_against_dominant_tags(tags, discounted_dominant)
+            for artist, tags in artist_tags.items()
         }
-        specificity = {
-            tag: 1.0 - (doc_freq[tag] / total_artists) for tag in dominant_tags
-        }
-        discounted_dominant = {tag: w * specificity[tag] for tag, w in dominant_tags.items()}
-        dominant_weight_total = sum(discounted_dominant.values())
-
-        scores = {}
-        for artist, tags in artist_tags.items():
-            if not tags or not dominant_weight_total:
-                scores[artist] = 0.0
-                continue
-            matched_weight = sum(discounted_dominant.get(t, 0.0) for t in tags)
-            scores[artist] = matched_weight / dominant_weight_total
-        return scores
 
     def _combine_outlier_signals(
         self,
