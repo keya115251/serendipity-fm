@@ -20,7 +20,7 @@ from app.core.config import settings
 from app.core.lastfm_client import LastFMClient
 from app.core.taste_profile import TasteProfileBuilder
 from app.core.tag_relevance import build_discounted_dominant_tags
-from app.core.discovery_walk import DiscoveryWalk
+from app.core.discovery_walk import DiscoveryWalk, diversify_top_n
 from app.core.seeding import build_seeds
 from app.db.artist_cache import ArtistDataCache
 
@@ -94,8 +94,28 @@ async def main(
             candidates, dominant_tags_by_seed, target_hop_distance=target_hop_distance, max_depth=max_depth
         )
 
-        print(f"\n--- Top 7 serendipitous recommendations ---")
-        for i, c in enumerate(scored[:7], 1):
+        # Weight each outlier seed's allocation share by how much CURRENT
+        # signal it actually represents (12-month playcount relative to
+        # the user's most-played artist), rather than treating every
+        # detected outlier as equally "alive." Primary seeds always get
+        # full weight (1.0) since they're already the dominant cluster by
+        # definition.
+        max_playcount = max(profile.long_term.artist_playcounts.values(), default=1)
+        cluster_relevance_weights: dict[str, float] = {}
+        for s in primary_seeds:
+            cluster_relevance_weights[s] = 1.0
+        for s in outlier_seeds_in_play:
+            playcount = profile.long_term.artist_playcounts.get(s, 0)
+            cluster_relevance_weights[s] = playcount / max_playcount if max_playcount else 0.0
+
+        print(f"Cluster relevance weights: {cluster_relevance_weights}\n")
+
+        final_recommendations = diversify_top_n(
+            scored, n=7, max_per_cluster=3, cluster_relevance_weights=cluster_relevance_weights
+        )
+
+        print(f"\n--- Top 7 serendipitous recommendations (diversity-capped) ---")
+        for i, c in enumerate(final_recommendations, 1):
             print(f"\n{i}. {c.artist}")
             print(f"   genres: {', '.join(c.tags) if c.tags else '(none)'}")
             print(f"   hop distance: {c.hop_distance}  |  listeners: {c.listeners:,}  |  score: {c.final_score:.4f}")

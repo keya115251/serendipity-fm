@@ -57,7 +57,10 @@ discovery rather than noise.
   cached similarity graph several hops deep, tracks the full path from
   seed to candidate (for explainability and debugging), and scores
   candidates on tag relevance to their own originating cluster, hop
-  distance, and a cluster-relative popularity factor. See "Debugging the
+  distance, and a cluster-relative popularity factor. A final
+  `diversify_top_n` selection step caps how much of the output any single
+  cluster can claim, with each cluster's allocation scaled by how much
+  current listening signal it actually represents. See "Debugging the
   discovery walk" below for the multi-stage process that got this design
   to its current state.
 
@@ -228,6 +231,32 @@ went from not appearing in the top 10 at all, to scoring 4th overall,
 ahead of three of the five prog/metal candidates that previously
 dominated the list outright.
 
+**The outlier-dominance problem.** Fixing cross-cluster fairness swung
+the bias the other way for a different profile: a listener whose primary
+cluster was alt/indie, with two detected outlier seeds (a K-pop group and
+a prog rock act), ended up with 4 of the top 5 recommendations being
+K-pop - the outlier cluster's candidates happened to sit at a more
+favorable point in their own narrow popularity distribution, and nothing
+in the scoring pipeline capped how much of the final output any one
+cluster could claim. Added `diversify_top_n`: a cap on max recommendations
+per cluster, plus a guarantee that every cluster with a viable candidate
+gets at least one slot (so a weak-but-real secondary cluster can't
+silently drop to zero just because it scored worse that particular run -
+the same failure outlier seeding was built to prevent in the first place,
+just resurfacing one stage later). This still wasn't quite right on its
+own: every detected outlier was getting the identical guaranteed slot and
+up-to-3 ceiling regardless of how much actual CURRENT signal it
+represented. For one listener, the K-pop outlier was almost entirely
+historical (the same stale-history pattern documented above - 787
+all-time plays, only 122 in the last 12 months), yet it received the same
+allocation as an outlier the listener still actively engaged with. Final
+fix: each outlier's slot allocation is now scaled by its 12-month
+playcount relative to the listener's most-played artist, and a cluster
+below a minimum relevance threshold loses the guarantee entirely (though
+it can still earn slots on pure score merit). The near-dormant K-pop
+cluster went from 2 of 7 final recommendations down to 1, while a more
+active secondary cluster in the same run kept its full guaranteed slot.
+
 **Tradeoffs accepted rather than further chased.** A candidate reachable
 from more than one seed only keeps the FIRST path encountered during
 traversal, which is order-dependent rather than necessarily "the most
@@ -237,7 +266,12 @@ knows) is mitigated by path visibility, not eliminated; a real fix would
 likely need per-hop relevance weighting keyed to something other than
 aggregate tag similarity, which was tried once, didn't change results,
 and was deprioritized in favor of the bigger, more clearly-broken
-cluster-fairness issues above.
+cluster-fairness issues above. Separately, the diversity cap operates at
+the seed-cluster level only - two final recommendations from the same
+primary cluster can still share the same hop-1 intermediate artist (e.g.
+both reached via the same bridge artist), which is the same
+one-branch-dominating pattern recurring at a smaller scale within a
+single cluster, not yet addressed.
 
 ## Tech stack
 

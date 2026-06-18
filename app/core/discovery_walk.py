@@ -358,3 +358,113 @@ class DiscoveryWalk:
             scored.append(candidate)
 
         return sorted(scored, key=lambda c: c.final_score, reverse=True)
+
+
+def diversify_top_n(
+    scored_candidates: list[WalkCandidate],
+    n: int = 7,
+    max_per_cluster: int = 3,
+    guarantee_min_one_per_cluster: bool = True,
+    cluster_relevance_weights: dict[str, float] | None = None,
+    min_relevance_for_guarantee: float = 0.1,
+) -> list[WalkCandidate]:
+    """
+    Selects the final top-N recommendations with a cap on how many can
+    come from any single seed cluster (candidate.path[0]), optionally
+    guaranteeing every cluster with at least one viable candidate a slot.
+
+    cluster_relevance_weights, if given, maps each seed/cluster to a 0-1
+    relevance weight reflecting how much CURRENT signal that cluster
+    actually represents in the user's listening (e.g. an outlier's
+    12-month playcount relative to the user's most-played artist). Each
+    cluster's effective max slot count is max_per_cluster scaled by its
+    weight (rounded, minimum 1 if guaranteed), and a cluster below
+    min_relevance_for_guarantee does NOT get the guaranteed slot at all,
+    even though it's still eligible to earn slots on pure score merit.
+
+    This exists because treating "detected as an outlier" as a flat
+    yes/no with equal downstream rights doesn't match reality: real
+    testing found a user whose outlier-detected K-pop cluster was almost
+    entirely historical (787 all-time plays, only 122 in the last 12
+    months - the same stale-history pattern that motivated using 12month
+    instead of overall for the long-term taste layer in the first place),
+    yet it received the same guaranteed slot and max-3 ceiling as a
+    cluster the user still actively listens to. Two K-pop recommendations
+    out of 7 felt wrong to the user specifically because that cluster's
+    real current relevance is low, even though it cleared the binary
+    outlier-detection bar. Weighting allocation by actual recent signal
+    fixes this without re-litigating outlier detection itself - an artist
+    can still BE a real secondary cluster while having a smaller, more
+    proportionate claim on the final output.
+
+    Without ANY of this (cap, guarantee, or weighting), a flat sort by
+    final_score can let one cluster dominate the entire output regardless
+    of whether it's the primary cluster or an outlier - real testing
+    showed both a secondary cluster getting zero representation, and
+    later, after fixing cluster-aware scoring and per-cluster popularity
+    normalization, an outlier cluster completely dominating instead (4 of
+    5 top results were K-pop for a listener whose primary cluster was
+    alt/indie). The cap and guarantee resolved that, but didn't address
+    the separate problem of an outlier's allocation being disproportionate
+    to how alive that cluster actually still is - hence this weighting.
+    """
+    cluster_relevance_weights = cluster_relevance_weights or {}
+
+    def effective_max(cluster: str) -> int:
+        weight = cluster_relevance_weights.get(cluster, 1.0)
+        scaled = round(max_per_cluster * weight)
+        return max(scaled, 1 if weight > 0 else 0)
+
+    def eligible_for_guarantee(cluster: str) -> bool:
+        weight = cluster_relevance_weights.get(cluster, 1.0)
+        return weight >= min_relevance_for_guarantee
+
+    by_cluster: dict[str, list[WalkCandidate]] = {}
+    for candidate in scored_candidates:
+        origin_seed = candidate.path[0] if candidate.path else None
+        by_cluster.setdefault(origin_seed, []).append(candidate)
+
+    selected: list[WalkCandidate] = []
+    cluster_counts: dict[str, int] = {}
+    already_selected_ids = set()
+
+    if guarantee_min_one_per_cluster:
+        # reserve each ELIGIBLE cluster's single best candidate first, in
+        # order of that candidate's own score - low-relevance clusters
+        # (e.g. an almost-entirely-historical outlier) don't get this
+        # guarantee, though they can still earn slots on pure merit below
+        guaranteed = sorted(
+            (
+                candidates[0]
+                for cluster, candidates in by_cluster.items()
+                if candidates and eligible_for_guarantee(cluster)
+            ),
+            key=lambda c: c.final_score,
+            reverse=True,
+        )
+        for candidate in guaranteed:
+            if len(selected) >= n:
+                break
+            origin_seed = candidate.path[0] if candidate.path else None
+            selected.append(candidate)
+            already_selected_ids.add(id(candidate))
+            cluster_counts[origin_seed] = cluster_counts.get(origin_seed, 0) + 1
+
+    # fill remaining slots greedily by overall score, respecting each
+    # cluster's OWN effective max (not a single shared max_per_cluster)
+    for candidate in scored_candidates:
+        if len(selected) >= n:
+            break
+        if id(candidate) in already_selected_ids:
+            continue
+        origin_seed = candidate.path[0] if candidate.path else None
+        count = cluster_counts.get(origin_seed, 0)
+        if count >= effective_max(origin_seed):
+            continue
+        selected.append(candidate)
+        cluster_counts[origin_seed] = count + 1
+
+    # re-sort the final selection by score, since the guarantee pass above
+    # may have placed a lower-scoring guaranteed pick ahead of higher-
+    # scoring candidates that got bumped past the cap
+    return sorted(selected, key=lambda c: c.final_score, reverse=True)
