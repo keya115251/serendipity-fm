@@ -31,7 +31,7 @@ import asyncio
 from difflib import SequenceMatcher
 
 EDITION_SUFFIX_PATTERN = re.compile(
-    r"\s*[\(\[](deluxe|expanded|special|anniversary|remaster(ed)?|"
+    r"\s*[\(\[][^()\[\]]*?(deluxe|expanded|special|anniversary|remaster(ed)?|"
     r"\d+(st|nd|rd|th)?\s*anniversary|hd audio|\d+-bit|bonus track|"
     r"live|acoustic|instrumental|edition|version)[^)\]]*[\)\]]\s*$",
     re.IGNORECASE,
@@ -43,6 +43,83 @@ LOOSE_SUFFIX_PATTERN = re.compile(r"\s*[-:]?\s*(ep|single)\s*$", re.IGNORECASE)
 FUZZY_MATCH_THRESHOLD = 0.85
 
 COLON_SUBTITLE_PATTERN = re.compile(r"^(.+?)\s*:\s*.+$")
+
+# unanchored keyword check, deliberately looser than EDITION_SUFFIX_PATTERN
+# (which requires a clean trailing-bracket structure) - used only as a
+# supporting signal alongside tag overlap in merge_high_tag_overlap_editions,
+# not as a standalone merge trigger on its own
+EDITION_KEYWORD_PATTERN = re.compile(
+    r"deluxe|expanded|special edition|anniversary|remaster|hd audio|"
+    r"\d+-bit|bonus track|live|acoustic|instrumental|edition|version",
+    re.IGNORECASE,
+)
+
+HIGH_TAG_OVERLAP_THRESHOLD = 0.90
+
+
+def merge_high_tag_overlap_editions(
+    groups: dict[str, list[dict]],
+    album_tags: dict[str, set[str]],
+) -> dict[str, list[dict]]:
+    """
+    Merges two groups (within the same artist's discography) if they
+    share very high tag overlap (>= HIGH_TAG_OVERLAP_THRESHOLD) AND at
+    least one of their names contains an edition-style keyword somewhere
+    in the title.
+
+    Built specifically because a real edition-variant title didn't fit
+    any existing structural pattern: "The Black Parade / Living With
+    Ghosts (The 10th Anniversary Edition)" is a SLASH-COMPOUND title with
+    its edition marker correctly stripped by EDITION_SUFFIX_PATTERN, but
+    what remains ("The Black Parade / Living With Ghosts") still doesn't
+    match the plain "The Black Parade" group by name - no amount of
+    title-pattern engineering can be expected to anticipate every
+    Last.fm title format. This uses the actual CONTENT (tag overlap) as
+    the merge signal instead of the name structure.
+
+    The edition-keyword requirement exists to guard against a real risk:
+    two genuinely DIFFERENT albums by the same artist can easily share
+    90%+ tag overlap purely because an artist's overall style is
+    consistent across their discography - that's not a duplicate, that's
+    just an artist with a stable sound. Requiring an edition keyword
+    somewhere in one of the names reduces (but does not eliminate) the
+    chance of merging two real, distinct releases. This is a heuristic
+    with real edge cases, not a guaranteed-safe rule like the mbid check.
+
+    album_tags maps each group's key (same keys as `groups`) to that
+    group's representative tag set, since groups themselves don't carry
+    tag data - the caller is responsible for fetching tags for at least
+    each group's representative album before calling this.
+    """
+    keys = list(groups.keys())
+    merged = dict(groups)
+    consumed: set[str] = set()
+
+    for key in keys:
+        if key in consumed or key not in merged:
+            continue
+        for other_key in keys:
+            if other_key == key or other_key in consumed or other_key not in merged:
+                continue
+            tags_a = album_tags.get(key, set())
+            tags_b = album_tags.get(other_key, set())
+            if not tags_a or not tags_b:
+                continue
+            overlap = len(tags_a & tags_b) / max(len(tags_a), len(tags_b))
+            if overlap < HIGH_TAG_OVERLAP_THRESHOLD:
+                continue
+            # check the ORIGINAL (unstripped) names within each group for
+            # an edition keyword - the group KEYS themselves are already
+            # edition-stripped by strip_edition_suffix during grouping,
+            # so the keyword we're looking for has already been removed
+            # from the key string by the time it gets here
+            names_in_either_group = [a["name"] for a in merged[key] + merged[other_key]]
+            if not any(EDITION_KEYWORD_PATTERN.search(name) for name in names_in_either_group):
+                continue
+            merged[key].extend(merged.pop(other_key))
+            consumed.add(other_key)
+
+    return merged
 
 
 def group_colon_subtitle_families(groups: dict[str, list[dict]]) -> dict[str, list[dict]]:

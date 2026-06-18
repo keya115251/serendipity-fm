@@ -20,73 +20,26 @@ discovery rather than noise.
 
 ## Architecture
 
-- **Last.fm client** (`app/core/lastfm_client.py`) - async wrapper around
-  Last.fm's public read API. Capped concurrency (semaphore + connection
-  pool limits) and automatic retry on timeout, since early testing hit
-  real `ConnectTimeout` errors under a burst of ~25 simultaneous requests.
-- **Persistent artist data cache** (`app/db/`) - SQLite-backed cache for
-  artist info, tags, and similarity edges, sitting between the live
-  Last.fm client and everything else. Exists because hop-expansion fans
-  out fast: a single seed with a similarity limit of 20 can produce
-  hundreds of candidates within two hops, each potentially needing its
-  own info/tags/similarity lookups, which isn't viable to re-fetch live on
-  every request.
-- **Taste profile builder** (`app/core/taste_profile.py`) - builds a
-  two-layer profile per user: a `long_term` layer from the last 12 months
-  of top artists, and a `short_term` layer from recent tracks. See below
-  for why "overall" history was deliberately rejected as the long-term
-  basis.
-- **Artist similarity graph** (`app/core/artist_graph.py`) - builds a
-  graph restricted to a user's own artist set, using Last.fm's
-  `artist.getSimilar` data, and scores each artist's connectivity to the
-  rest of the user's profile.
-- **Outlier detection** - combines tag-based relevance and graph
-  connectivity to flag artists that represent a genuinely different taste
-  thread within a profile.
-- **Shared tag relevance utility** (`app/core/tag_relevance.py`) - the
-  document-frequency-discounted dominant-tag-set logic, extracted into
-  its own module so outlier detection and the discovery walk both use the
-  identical, validated implementation instead of two copies that could
-  drift apart.
-- **Seed selection** (`app/core/seeding.py`) - builds the discovery
-  walk's seed list from a mix of top-by-playcount artists and detected
-  outliers, so a real secondary taste cluster gets explored even if none
-  of its artists crack the top N by raw playcount.
-- **Discovery walk** (`app/core/discovery_walk.py`) - the actual
-  recommendation engine. Expands outward from seed artists through the
-  cached similarity graph several hops deep, tracks the full path from
-  seed to candidate (for explainability and debugging), and scores
-  candidates on tag relevance to their own originating cluster, hop
-  distance, and a cluster-relative popularity factor. A final
-  `diversify_top_n` selection step caps how much of the output any single
-  cluster can claim, with each cluster's allocation scaled by how much
-  current listening signal it actually represents. See "Debugging the
-  discovery walk" below for the multi-stage process that got this design
-  to its current state.
-- **Album entry points** (`app/core/album_selection.py`) - for each
-  artist the discovery walk recommends, suggests a specific "start here"
-  album rather than just an artist name. Two selectors:
-  `pick_entry_point_album` (pure popularity, after deduping catalogue
-  fragments/edition variants) and `pick_entry_point_album_with_tags`
-  (scores an artist's most-played albums against the same cluster-specific
-  dominant tags used to recommend the artist itself, so the suggested
-  album matches the actual reason the artist surfaced, not just whatever
-  they're most generically famous for). See "Debugging album selection"
-  below for the real catalogue-data problems this had to work around.
-- **Album outliers (shelved)** (`app/core/album_outliers.py`) - applies
-  the same tag-relevance outlier-detection logic one level down, to find
-  stylistically divergent albums within a single KNOWN artist's own
-  discography. Built and functional, but shelved after real testing
-  against an artist's full discography never actually surfaced a genuine
-  stylistic outlier - every flagged result turned out to be a cataloguing
-  artifact (sparse-tag fragments, deluxe-edition splits, sales-tactic
-  album repackagings) rather than real creative divergence. Unlike
-  artist-level outlier detection, there's no album-level equivalent of
-  `artist.getSimilar` to use as a second, independent signal, so this
-  mode never had the cross-validation that made artist-level detection
-  trustworthy. The code is kept (the dedup logic is real, reusable
-  infrastructure already used by the entry-point selectors above), but
-  the feature itself isn't considered production-ready.
+The diagram above shows the two main paths through the system: a
+personalized pipeline that needs a Last.fm username, and a standalone
+artist/album lookup that doesn't. Module reference:
+
+| Module | Role |
+|---|---|
+| `app/core/lastfm_client.py` | Async Last.fm API wrapper, capped concurrency, retry on timeout |
+| `app/db/` | SQLite cache for artist info, tags, similarity edges |
+| `app/core/taste_profile.py` | Two-layer (12-month + recent) taste profile, outlier detection |
+| `app/core/artist_graph.py` | Similarity graph restricted to a user's own artists, connectivity scoring |
+| `app/core/tag_relevance.py` | Shared document-frequency-discounted tag relevance logic |
+| `app/core/seeding.py` | Mixes top-by-playcount artists with detected outliers for walk seeding |
+| `app/core/discovery_walk.py` | The recommendation engine: expand, cluster-aware score, diversify |
+| `app/core/album_selection.py` | Dedup logic + entry-point album selection (plain and tag-aware) |
+| `app/core/album_outliers.py` | Album-level outlier detection - built, shelved, see below |
+| `app/core/lookup.py` | Standalone artist/album lookup, no Last.fm account needed |
+
+Full reasoning for each piece, including the real bugs found and fixed
+along the way, lives in the debugging sections below - this table is
+just the map.
 
 ## Why two taste layers, and why 12-month, not all-time
 
@@ -353,6 +306,47 @@ the dedup infrastructure it shares with entry-point selection is real and
 useful, but the outlier-detection feature itself isn't considered
 production-ready.
 
+## Debugging the standalone lookup feature
+
+Built for visitors without a Last.fm account: give one artist or album,
+get similar ones back, no profile or taste cluster involved. Reuses
+validated pieces (mbid filtering, entry-point album selection) without
+depending on a username.
+
+**A title format the dedup logic had never seen.** Looking up "The
+Black Parade" by My Chemical Romance surfaced "The Black Parade / Living
+With Ghosts (The 10th Anniversary Edition)" as a top result - the seed
+album recommending itself. Two separate bugs: first, the edition-suffix
+regex required its keyword to appear immediately after the opening
+bracket, so "(The 10th Anniversary Edition)" - with "The" in between -
+didn't match at all; broadened the pattern to allow leading words before
+the keyword. Second, even after that fix, what remained was a
+slash-compound title ("The Black Parade / Living With Ghosts") that
+still didn't match the plain "The Black Parade" group by name. Rather
+than keep special-casing title formats, added a content-based merge
+instead: two same-artist albums with very high tag overlap (90%+) AND an
+edition keyword present in one of the original names get merged,
+regardless of how the title is structured. The keyword requirement
+guards against the real risk that two genuinely different albums can
+share high tag overlap just from an artist's style being consistent
+across their discography.
+
+**Artist similarity outweighing actual sound.** Initial scoring (0.4
+artist-similarity, 0.6 tag-overlap) let "Stomachaches" by Frank Iero (an
+MCR member's solo project, high artist-similarity but only 40% tag
+overlap) outscore "Infinity on High" by Fall Out Boy (lower
+artist-similarity but a real, comparable tag match) - "this person was
+in the band" was carrying more weight than whether the music actually
+sounds similar. Reweighted to 0.3/0.7 in favor of tag overlap; verified
+against the real scores from this exact case that the ordering flips
+correctly.
+
+**Diversity cap needed a guarantee, not just a ceiling.** A cap of 2
+albums per artist still let MCR, Gerard Way, and The Used fill 6 of 7
+results - the same cap-without-guarantee gap already learned from
+`diversify_top_n`. Lowered to 1 per artist so every result is a
+different act.
+
 **Tradeoffs accepted rather than further chased.** A candidate reachable
 from more than one seed only keeps the FIRST path encountered during
 traversal, which is order-dependent rather than necessarily "the most
@@ -396,6 +390,8 @@ python -m tests.test_artist_cache <artist_name>
 python -m tests.test_discovery_walk <username> [target_hop_distance] [max_depth] [max_hops]
 python -m tests.test_album_selection <artist_name> [<artist_name> ...]
 python -m tests.test_album_outliers <artist_name>
+python -m tests.test_lookup artist <artist_name>
+python -m tests.test_lookup album <artist_name> <album_name>
 ```
 
 `test_discovery_walk` is the main end-to-end test: builds a real taste
