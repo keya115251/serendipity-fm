@@ -114,9 +114,13 @@ async def main(
             scored, n=7, max_per_cluster=3, cluster_relevance_weights=cluster_relevance_weights
         )
 
+        print("Fetching entry-point albums for final recommendations...")
+        final_recommendations = await walk.attach_entry_point_albums(final_recommendations, dominant_tags_by_seed)
+
         print(f"\n--- Top 7 serendipitous recommendations (diversity-capped) ---")
         for i, c in enumerate(final_recommendations, 1):
             print(f"\n{i}. {c.artist}")
+            print(f"   start here: {c.entry_point_album or '(no album data found)'}")
             print(f"   genres: {', '.join(c.tags) if c.tags else '(none)'}")
             print(f"   hop distance: {c.hop_distance}  |  listeners: {c.listeners:,}  |  score: {c.final_score:.4f}")
             print(f"   path: {' -> '.join(c.path)}")

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 
 from app.db.artist_cache import ArtistDataCache
 from app.core.tag_relevance import score_relevance_against_dominant_tags
+from app.core.album_selection import pick_entry_point_album, pick_entry_point_album_with_tags
 
 
 @dataclass
@@ -44,6 +45,7 @@ class WalkCandidate:
     discovered_via: str = ""  # immediate parent - kept for backward compat / quick display
     tags: list[str] = field(default_factory=list)  # candidate's own top tags, for display/explainability
     path: list[str] = field(default_factory=list)  # full chain from seed to candidate, e.g. ["Bon Iver", "Phoebe Bridgers", "The Marías", "Not For Radio"]
+    entry_point_album: str | None = None  # suggested "start here" album, populated by attach_entry_point_albums()
 
 
 class DiscoveryWalk:
@@ -54,6 +56,68 @@ class DiscoveryWalk:
         self.similar_limit = similar_limit
         self.max_hops = max_hops
         self.max_frontier_per_hop = max_frontier_per_hop
+
+    async def attach_entry_point_albums(
+        self,
+        recommendations: list[WalkCandidate],
+        dominant_tags_by_seed: dict[str, dict[str, float]] | None = None,
+    ) -> list[WalkCandidate]:
+        """
+        Fetches each recommendation's discography and assigns a suggested
+        "start here" album.
+
+        If dominant_tags_by_seed is given, uses
+        pick_entry_point_album_with_tags, scoring each candidate's
+        discography against ITS OWN originating cluster's dominant tags
+        (looked up via candidate.path[0], same as the artist-level scoring
+        in score_candidates) rather than picking purely by popularity. The
+        rationale mirrors why artist scoring became cluster-aware in the
+        first place: an artist gets recommended because it matched a
+        specific taste cluster, so the suggested album should reflect
+        that same match, not just "whatever this artist is most famous
+        for in general."
+
+        If dominant_tags_by_seed is omitted, falls back to
+        pick_entry_point_album (pure popularity) - useful for callers that
+        haven't built per-cluster tag profiles, or for quick smoke tests.
+
+        Deliberately calls self.cache.client directly for both the
+        discography and album-tag lookups, rather than going through a
+        cached ArtistDataCache method: this only runs on the final,
+        already-diversity-capped recommendation list (typically 7
+        artists, each considering at most 4 albums for tag scoring), not
+        the hundreds-deep candidate pool that originally justified
+        building the full SQLite-backed caching layer. Adding new cached
+        tables for this would be more scaffolding than the feature
+        currently needs.
+        """
+        dominant_tags_by_seed = dominant_tags_by_seed or {}
+
+        async def fetch_album_tags(artist_name: str, album_name: str) -> list[dict]:
+            info = await self.cache.client.get_album_info(artist_name, album_name)
+            # get_album_info returns tags as plain lowercase strings with
+            # no per-tag weight (unlike artist tags) - treat every tag as
+            # equally weighted (count=100) since that's the most honest
+            # representation of what the API actually gives us here
+            return [{"tag": t, "count": 100} for t in info.get("tags", [])]
+
+        async def fetch_and_pick(candidate: WalkCandidate):
+            albums = await self.cache.client.get_artist_top_albums(candidate.artist, limit=15)
+
+            origin_seed = candidate.path[0] if candidate.path else None
+            cluster_tags = dominant_tags_by_seed.get(origin_seed)
+
+            if cluster_tags:
+                entry_point = await pick_entry_point_album_with_tags(
+                    candidate.artist, albums, cluster_tags, fetch_album_tags
+                )
+            else:
+                entry_point = pick_entry_point_album(albums)
+
+            candidate.entry_point_album = entry_point["name"] if entry_point else None
+            return candidate
+
+        return await asyncio.gather(*(fetch_and_pick(c) for c in recommendations))
 
     async def expand(
         self,

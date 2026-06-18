@@ -1,0 +1,270 @@
+"""
+Picks a sensible "start here" album from an artist's Last.fm discography.
+
+Naive top-by-playcount doesn't work on its own - real testing against
+Last.fm's actual artist.getTopAlbums data showed three concrete failure
+modes:
+
+1. Shared-mbid duplicates: "Hozier" and "Hozier (Special Edition)" share
+   the exact same MusicBrainz ID, meaning Last.fm has split one real
+   album's plays across multiple catalogue entries.
+
+2. Edition-suffix fragmentation: "Waving at the Sky" vs "Waving at the
+   Sky (24-bit HD audio)" - distinct catalogue rows, no shared mbid,
+   needing a name-pattern heuristic instead.
+
+3. Small-artist punctuation/spelling fragmentation: a niche K-pop-
+   adjacent artist had the SAME album catalogued as "1.Got Hooked: An
+   Addictive Symphony" (the dominant entry, real mbid), "1. Got Hooked:
+   An Addictive Symphony - EP", "1. Got Hooked: An Addictive Symphony"
+   (extra space after the period), and "Got Hooked: An Addictive
+   Symphony" (no leading "1." at all) - none of which are "edition"
+   variants in any sense the suffix regex understands, just inconsistent
+   manual data entry. This happened to not change the outcome in testing
+   (one entry was dominant enough to win regardless), but a more evenly
+   split case could have under-counted the real album's popularity or
+   picked a malformed variant as the representative.
+"""
+
+import re
+import asyncio
+from difflib import SequenceMatcher
+
+EDITION_SUFFIX_PATTERN = re.compile(
+    r"\s*[\(\[](deluxe|expanded|special|anniversary|remaster(ed)?|"
+    r"\d+(st|nd|rd|th)?\s*anniversary|hd audio|\d+-bit|bonus track|"
+    r"live|acoustic|instrumental|edition|version)[^)\]]*[\)\]]\s*$",
+    re.IGNORECASE,
+)
+
+# loose suffix markers that aren't bracketed (e.g. "... - EP", "... EP")
+LOOSE_SUFFIX_PATTERN = re.compile(r"\s*[-:]?\s*(ep|single)\s*$", re.IGNORECASE)
+
+FUZZY_MATCH_THRESHOLD = 0.85
+
+COLON_SUBTITLE_PATTERN = re.compile(r"^(.+?)\s*:\s*.+$")
+
+
+def group_colon_subtitle_families(groups: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """
+    Merges groups whose name matches "Parent: Subtitle" with a group
+    whose name is exactly "Parent" - e.g. "Unreal Unearth: Unheard" and
+    "Unreal Unearth: Unending" both merge into "Unreal Unearth".
+
+    This is DELIBERATELY NOT part of the core dedup pipeline
+    (deduped_album_groups) used by pick_entry_point_album and
+    pick_entry_point_album_with_tags, and is not called anywhere in this
+    module - it's opt-in, used only by app/core/album_outliers.py.
+
+    The reason: a colon-subtitle is genuinely ambiguous in a way the
+    bracketed edition-suffix pattern isn't. "Album: Subtitle" is
+    structurally identical to how many completely standalone, unrelated
+    album titles are formatted - this heuristic WILL over-merge in some
+    cases (a legitimately separate "B-Sides" or concept-sequel release
+    sharing a colon-prefixed name with its parent would incorrectly
+    collapse here). It's accepted specifically for outlier detection,
+    where the cost of a false merge (one fewer album considered) is much
+    lower than the cost of a false outlier flag from a sparse-data
+    fragment, but NOT accepted for entry-point selection, where merging
+    two genuinely different releases could mean recommending the wrong
+    one entirely.
+    """
+    merged = dict(groups)
+    for key in list(merged.keys()):
+        match = COLON_SUBTITLE_PATTERN.match(key)
+        if not match:
+            continue
+        parent_key = match.group(1).strip()
+        if parent_key in merged and parent_key != key:
+            merged[parent_key].extend(merged.pop(key))
+    return merged
+
+
+def strip_edition_suffix(album_name: str) -> str:
+    """
+    Strips a trailing parenthetical/bracketed edition marker AND loose
+    "- EP"/"Single" suffixes from an album name, e.g.
+    "Hozier (Expanded Edition)" -> "Hozier",
+    "Got Hooked: An Addictive Symphony - EP" -> "Got Hooked: An Addictive Symphony".
+    Used as the dedup key for albums that don't share an mbid but are
+    still clearly the same underlying release.
+    """
+    stripped = EDITION_SUFFIX_PATTERN.sub("", album_name)
+    stripped = LOOSE_SUFFIX_PATTERN.sub("", stripped)
+    return stripped.strip()
+
+
+def _normalize_for_fuzzy_match(name: str) -> str:
+    """Lowercase and collapse non-alphanumeric characters, so '1.Got Hooked' and '1. Got Hooked' normalize identically."""
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def _merge_fuzzy_duplicate_groups(groups: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """
+    Second merge pass: collapses groups whose keys are near-identical
+    after aggressive normalization (punctuation/spacing stripped) and
+    pass a fuzzy string similarity threshold. This catches the kind of
+    small-artist catalogue fragmentation exact-match grouping misses
+    entirely - e.g. "1.gothooked..." and "1.gothooked...ep" and
+    "gothooked..." (missing the leading "1.") are different strings even
+    after edition-suffix stripping, but are clearly the same release.
+
+    O(k^2) in the number of distinct groups k, which is fine here since k
+    is at most the number of albums passed in (typically under 20).
+    """
+    keys = list(groups.keys())
+    normalized = {k: _normalize_for_fuzzy_match(k) for k in keys}
+
+    merged: dict[str, list[dict]] = {}
+    consumed: set[str] = set()
+
+    for key in keys:
+        if key in consumed:
+            continue
+        bucket = list(groups[key])
+        consumed.add(key)
+        for other_key in keys:
+            if other_key in consumed:
+                continue
+            similarity = SequenceMatcher(None, normalized[key], normalized[other_key]).ratio()
+            if similarity >= FUZZY_MATCH_THRESHOLD:
+                bucket.extend(groups[other_key])
+                consumed.add(other_key)
+        merged[key] = bucket
+
+    return merged
+
+
+def deduped_album_groups(albums: list[dict]) -> dict[str, list[dict]]:
+    """
+    Runs both merge passes (edition-suffix stripping, then fuzzy
+    punctuation/spelling matching) and returns the deduped groups keyed
+    by their first-pass normalized name. Shared by both the plain
+    popularity-based selector and the tag-aware one below, since the
+    dedup logic itself doesn't depend on whether the final pick considers
+    tags.
+    """
+    groups: dict[str, list[dict]] = {}
+    for album in albums:
+        key = strip_edition_suffix(album["name"]).lower()
+        groups.setdefault(key, []).append(album)
+    return _merge_fuzzy_duplicate_groups(groups)
+
+
+def representative_for_group(group: list[dict]) -> dict:
+    """Within a deduped group, prefer a PLAIN entry (no edition suffix) over a higher-playcount edition variant."""
+    plain_entries = [a for a in group if strip_edition_suffix(a["name"]) == a["name"]]
+    candidates_pool = plain_entries or group
+    return max(candidates_pool, key=lambda a: a["playcount"])
+
+
+def pick_entry_point_album(albums: list[dict]) -> dict | None:
+    """
+    Given a raw artist.getTopAlbums-shaped list (each dict with name,
+    playcount, mbid), returns the single best "start here" album by
+    PURE POPULARITY: real duplicate entries are collapsed first (see
+    module docstring for the three real fragmentation bugs this dedup
+    logic was built to fix), then the highest combined-playcount group's
+    representative entry is returned.
+
+    This is the popularity-only selector. For a version that also
+    considers tag relevance to a specific listener's taste cluster, see
+    pick_entry_point_album_with_tags - that version requires fetching
+    each candidate album's own tags (an extra API call per album), so it
+    isn't always the right default; this one stays available as the
+    cheaper, dependency-free option.
+
+    Returns None if the input list is empty.
+    """
+    if not albums:
+        return None
+
+    groups = deduped_album_groups(albums)
+    best_group = max(groups.values(), key=lambda group: sum(a["playcount"] for a in group))
+    return representative_for_group(best_group)
+
+
+async def pick_entry_point_album_with_tags(
+    artist_name: str,
+    albums: list[dict],
+    dominant_tags: dict[str, float],
+    fetch_album_tags,
+    consider_top_n: int = 4,
+    tag_weight: float = 0.6,
+) -> dict | None:
+    """
+    Tag-aware version of pick_entry_point_album: among an artist's most
+    popular albums (after the same dedup as the plain version), picks
+    whichever one best matches the LISTENER'S OWN dominant tags, not just
+    whichever is most generically popular.
+
+    Rationale: an artist gets recommended because they matched a
+    specific taste cluster, but their single most popular album might
+    not be their most representative one for THAT specific match - an
+    artist with a wide stylistic range across their discography could
+    have a more mainstream album that doesn't actually sound like why
+    they were recommended in the first place. Scoring candidate albums
+    against the same dominant_tags used to score the artist recommendation
+    itself keeps the "start here" pick aligned with the actual reason
+    this artist surfaced.
+
+    Only the top `consider_top_n` groups by combined playcount are
+    considered for tag fetching (default 4) - fetching tags for an
+    artist's ENTIRE discography to find a slightly-better-matching deep
+    cut isn't worth the extra API calls or the risk of recommending
+    something genuinely obscure as a "start here" pick, which defeats the
+    purpose of an entry point.
+
+    final score per candidate = (1 - tag_weight) * popularity_score +
+    tag_weight * tag_relevance, where popularity_score is each
+    candidate's combined playcount normalized against the most popular
+    candidate in the considered set (so the most popular one always
+    scores 1.0 on that axis, not an arbitrary absolute number).
+
+    fetch_album_tags is an async callable: (artist_name, album_name) ->
+    list[{"tag": str, "count": int}], matching LastFMClient.get_album_info
+    or an equivalent cache-backed wrapper. Injected as a parameter rather
+    than imported directly, since this module otherwise has zero
+    dependency on the Last.fm client itself and shouldn't gain one just
+    for this optional path.
+
+    Falls back to pick_entry_point_album's pure-popularity result if
+    dominant_tags is empty (nothing to score against) or if no candidate
+    album returns any tags at all.
+    """
+    if not albums:
+        return None
+
+    groups = deduped_album_groups(albums)
+    if not dominant_tags:
+        best_group = max(groups.values(), key=lambda group: sum(a["playcount"] for a in group))
+        return representative_for_group(best_group)
+
+    ranked_groups = sorted(groups.values(), key=lambda group: sum(a["playcount"] for a in group), reverse=True)
+    top_groups = ranked_groups[:consider_top_n]
+    representatives = [representative_for_group(g) for g in top_groups]
+
+    async def score_one(rep: dict, group: list[dict]) -> tuple[dict, float, float]:
+        tags = await fetch_album_tags(artist_name, rep["name"])
+        relevance = sum(dominant_tags.get(t["tag"], 0.0) * (t["count"] / 100) for t in tags) if tags else 0.0
+        playcount = sum(a["playcount"] for a in group)
+        return rep, relevance, playcount
+
+    scored = await asyncio.gather(*(score_one(rep, group) for rep, group in zip(representatives, top_groups)))
+
+    max_playcount = max((pc for _, _, pc in scored), default=1) or 1
+    max_relevance = max((rel for _, rel, _ in scored), default=0.0)
+
+    if max_relevance == 0.0:
+        # nothing returned usable tag data - fall back to pure popularity
+        # rather than pretending tag scoring did something it didn't
+        best_group = max(groups.values(), key=lambda group: sum(a["playcount"] for a in group))
+        return representative_for_group(best_group)
+
+    def combined_score(relevance: float, playcount: int) -> float:
+        popularity_score = playcount / max_playcount
+        tag_score = relevance / max_relevance
+        return (1 - tag_weight) * popularity_score + tag_weight * tag_score
+
+    best = max(scored, key=lambda triple: combined_score(triple[1], triple[2]))
+    return best[0]

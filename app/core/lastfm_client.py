@@ -162,6 +162,69 @@ class LastFMClient:
             for t in tags
         ]
 
+    # ---- album-level methods ----
+    # NOTE: Last.fm has no album.getSimilar equivalent - album-level
+    # discovery has to be built from artist-level similarity plus
+    # per-album metadata, not a dedicated album similarity graph.
+
+    async def get_artist_top_albums(self, artist: str, limit: int = 20) -> list[dict]:
+        """
+        Returns an artist's albums ranked by Last.fm playcount (their own
+        internal popularity ranking for that artist's discography, NOT
+        global cross-artist popularity). Used as the basis for picking a
+        "start here" album: the top-ranked album is the closest thing
+        Last.fm gives us to "the canonical, most-approachable entry point"
+        for an artist.
+        """
+        data = await self._call(
+            "artist.gettopalbums",
+            artist=artist,
+            limit=limit,
+            autocorrect=1,
+        )
+        albums = data.get("topalbums", {}).get("album", [])
+        return [
+            {
+                "name": a.get("name", ""),
+                "playcount": int(a.get("playcount", 0)),
+                "mbid": a.get("mbid") or None,
+            }
+            for a in albums
+        ]
+
+    async def get_album_info(self, artist: str, album: str) -> dict:
+        """
+        Returns album metadata including its own tags and listener/playcount
+        stats.
+
+        Defensively handles tags being something other than the expected
+        {"tag": [...]} dict shape: real testing against live data hit an
+        AttributeError because Last.fm returns "tags": "" (a bare empty
+        string) for albums with no tags at all, rather than the expected
+        {"tag": []} structure. isinstance check below treats anything
+        that isn't a dict as "no tags" rather than crashing.
+        """
+        data = await self._call(
+            "album.getinfo",
+            artist=artist,
+            album=album,
+            autocorrect=1,
+        )
+        info = data.get("album", {})
+        tags_field = info.get("tags", {})
+        raw_tags = tags_field.get("tag", []) if isinstance(tags_field, dict) else []
+        # Last.fm sometimes returns a single tag as a bare dict instead of
+        # a one-item list - normalize defensively rather than assume
+        tags = [raw_tags] if isinstance(raw_tags, dict) else raw_tags
+        return {
+            "name": info.get("name", album),
+            "artist": info.get("artist", artist),
+            "listeners": int(info.get("listeners", 0)),
+            "playcount": int(info.get("playcount", 0)),
+            "mbid": info.get("mbid") or None,
+            "tags": [t.get("name", "").lower() for t in tags],
+        }
+
     async def get_artist_info(self, artist: str) -> dict:
         """
         Returns basic info including global listener/playcount (used for

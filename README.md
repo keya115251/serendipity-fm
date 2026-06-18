@@ -63,6 +63,30 @@ discovery rather than noise.
   current listening signal it actually represents. See "Debugging the
   discovery walk" below for the multi-stage process that got this design
   to its current state.
+- **Album entry points** (`app/core/album_selection.py`) - for each
+  artist the discovery walk recommends, suggests a specific "start here"
+  album rather than just an artist name. Two selectors:
+  `pick_entry_point_album` (pure popularity, after deduping catalogue
+  fragments/edition variants) and `pick_entry_point_album_with_tags`
+  (scores an artist's most-played albums against the same cluster-specific
+  dominant tags used to recommend the artist itself, so the suggested
+  album matches the actual reason the artist surfaced, not just whatever
+  they're most generically famous for). See "Debugging album selection"
+  below for the real catalogue-data problems this had to work around.
+- **Album outliers (shelved)** (`app/core/album_outliers.py`) - applies
+  the same tag-relevance outlier-detection logic one level down, to find
+  stylistically divergent albums within a single KNOWN artist's own
+  discography. Built and functional, but shelved after real testing
+  against an artist's full discography never actually surfaced a genuine
+  stylistic outlier - every flagged result turned out to be a cataloguing
+  artifact (sparse-tag fragments, deluxe-edition splits, sales-tactic
+  album repackagings) rather than real creative divergence. Unlike
+  artist-level outlier detection, there's no album-level equivalent of
+  `artist.getSimilar` to use as a second, independent signal, so this
+  mode never had the cross-validation that made artist-level detection
+  trustworthy. The code is kept (the dedup logic is real, reusable
+  infrastructure already used by the entry-point selectors above), but
+  the feature itself isn't considered production-ready.
 
 ## Why two taste layers, and why 12-month, not all-time
 
@@ -257,6 +281,78 @@ it can still earn slots on pure score merit). The near-dormant K-pop
 cluster went from 2 of 7 final recommendations down to 1, while a more
 active secondary cluster in the same run kept its full guaranteed slot.
 
+## Debugging album selection
+
+Once the discovery walk was producing solid artist recommendations, the
+next question was obvious: recommend an artist, sure, but where should a
+listener actually start? Real testing against artist.getTopAlbums
+exposed why "just take the highest-playcount album" doesn't work.
+
+**Shared-mbid duplicates.** Hozier's self-titled debut, its Expanded
+Edition, and its Special Edition are catalogued as separate rows.
+Expanded and Special share one MusicBrainz ID; the plain edition has a
+DIFFERENT one - so grouping by mbid alone under-merges, splitting one
+real album into two competing groups. Switched to grouping by
+edition-suffix-stripped name as the primary key instead, with mbid no
+longer load-bearing for this specific purpose.
+
+**Picking the wrong representative within a group.** Even after correct
+grouping, naively taking the highest-individual-playcount row within the
+winning group returned "Hozier (Expanded Edition)" instead of plain
+"Hozier" - a more confusing entry point than the original release, even
+though the math correctly identified WHICH album won. Fixed by preferring
+a plain, no-suffix entry within the winning group whenever one exists.
+
+**Small-artist punctuation fragmentation.** A niche artist's debut album
+was catalogued as four near-identical spellings ("1.Got Hooked: An
+Addictive Symphony", "1. Got Hooked: An Addictive Symphony - EP", with
+and without a leading "1.", with and without a space after the period) -
+none of which are "edition" variants the suffix regex understands, just
+inconsistent manual data entry. This happened to not change the outcome
+in initial testing (one entry was dominant enough to win regardless), but
+a more evenly-split case could have under-counted the real album's
+popularity. Added a second, fuzzy-string-similarity merge pass
+(`difflib.SequenceMatcher` against aggressively punctuation-stripped
+names) specifically to catch this class of fragmentation that exact
+matching can't.
+
+**Tag-aware selection, and why pure popularity isn't always right
+either.** An artist gets recommended because they matched a specific
+taste cluster, but their single most popular album might not be their
+most representative one for THAT match - an artist with real stylistic
+range across their discography could have a more mainstream album that
+doesn't actually sound like why they surfaced in the first place. Added
+`pick_entry_point_album_with_tags`: among an artist's top few albums by
+combined playcount (after the same dedup), score each against the SAME
+per-cluster dominant tags used to score the artist recommendation itself,
+blending tag fit with popularity rather than using either alone.
+
+**Album-level outlier detection, and why it's shelved.** Tried extending
+the same outlier-detection thesis one level down - finding stylistically
+divergent albums within a single known artist's own discography. Real
+testing against a real discography (Hozier's) repeatedly surfaced false
+positives that turned out to be cataloguing artifacts, not genuine
+musical divergence: albums with 0-1 tags scoring a flat 0.0 relevance
+purely from lacking data (fixed with a minimum-tag-count eligibility
+gate); deluxe/extended-tracklist entries like "Unreal Unearth: Unheard"
+and "Unreal Unearth: Unending" that needed a colon-subtitle merging
+heuristic on top of the existing dedup (added, but deliberately scoped
+to album-outlier detection only, NOT applied to entry-point selection,
+since the over-merge risk is acceptable in one context and not the
+other); and finally, albums that were neither pre-release singles nor
+deluxe editions but post-release marketing repackagings (the same
+tracklist resold as a separate "album" with one extra song, a sales
+tactic, not a cataloguing edition) - which slipped past every fix above
+because they have genuinely real, if sparse, independent tag data. With
+no album-level equivalent of artist.getSimilar to use as a second,
+independent validating signal (the thing that made artist-level outlier
+detection actually trustworthy), and a real catalogue-data ceiling that
+kept producing artifacts rather than genuine discoveries no matter how
+many heuristics were added, this mode is shelved rather than shipped -
+the dedup infrastructure it shares with entry-point selection is real and
+useful, but the outlier-detection feature itself isn't considered
+production-ready.
+
 **Tradeoffs accepted rather than further chased.** A candidate reachable
 from more than one seed only keeps the FIRST path encountered during
 traversal, which is order-dependent rather than necessarily "the most
@@ -298,12 +394,17 @@ python -m tests.test_taste_profile <username>
 python -m tests.test_artist_graph <username>
 python -m tests.test_artist_cache <artist_name>
 python -m tests.test_discovery_walk <username> [target_hop_distance] [max_depth] [max_hops]
+python -m tests.test_album_selection <artist_name> [<artist_name> ...]
+python -m tests.test_album_outliers <artist_name>
 ```
 
 `test_discovery_walk` is the main end-to-end test: builds a real taste
 profile, seeds the walk from top artists plus any detected outliers,
-expands through the cached similarity graph, and prints the top 7 scored
-recommendations with their full discovery path and genre tags.
+expands through the cached similarity graph, scores and diversity-caps
+the results, and attaches a suggested entry-point album to each final
+recommendation. `test_album_outliers` exercises the shelved album-outlier
+mode (see "Debugging album selection" above) - functional, but not
+considered production-ready.
 
 See `tests/debug/README.md` for the diagnostic scripts referenced in the
 debugging narrative above.
