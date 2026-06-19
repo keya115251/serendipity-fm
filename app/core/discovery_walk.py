@@ -252,6 +252,7 @@ class DiscoveryWalk:
         min_listeners: int = 5000,
         max_depth: int | None = None,
         previously_liked_artists: set[str] | None = None,
+        niche_level: float = 0.5,
     ) -> list[WalkCandidate]:
         """
         Fetches tags + popularity for every candidate (concurrently, cache-
@@ -332,6 +333,21 @@ class DiscoveryWalk:
         DiscoveryWalk.attach_entry_point_albums' album_feedback
         parameter), which would be permanently unreachable if liked
         artists were fully excluded from candidacy.
+
+        niche_level (0.0-1.0, default 0.5) is the "how obscure should
+        results be" slider. It works by tuning the popularity_factor's
+        floor (previously a fixed 0.3): 0.5 reproduces that original
+        validated floor EXACTLY (verified algebraically, not just
+        approximately), since every prior debugging-history result in
+        this project was tested against that specific value. Below 0.5
+        the floor rises toward 0.9 (popularity barely matters, favors
+        recognizable results); above 0.5 it falls toward 0.0 (full
+        sensitivity to obscurity, favors deep cuts). Only the midpoint
+        has been validated against real output - the endpoints are a
+        reasonable extrapolation of the same validated mechanism, not
+        independently proven, and should be checked against real runs
+        before being trusted as "correct," the same way 0.3 itself only
+        became trustworthy after the Bayside test case.
 
         POPULARITY NORMALIZATION IS PER-CLUSTER, not global. Real testing
         on a multi-cluster profile (prog/metal-dominant with a real
@@ -430,12 +446,33 @@ class DiscoveryWalk:
             # cluster fit (Bayside, tag_relevance=0.69) losing to a much
             # weaker absolute fit elsewhere purely because it happened to
             # be the most mainstream artist in its specific cluster
-            # sample. A floor (0.3) means popularity can never fully
-            # override tag fit, and the **0.5 (square root) dampens the
-            # remaining spread so popularity differentiates similar-fit
-            # candidates without dominating the comparison the way a
-            # linear or harsher term did.
-            floored_percentile = 0.3 + 0.7 * raw_popularity_percentile
+            # sample. A floor means popularity can never fully override
+            # tag fit, and the **0.5 (square root) dampens the remaining
+            # spread so popularity differentiates similar-fit candidates
+            # without dominating the comparison the way a linear or
+            # harsher term did.
+            #
+            # The floor itself is now the niche-ness slider's mechanism
+            # (niche_level, 0-1, default 0.5). Piecewise-linear mapping,
+            # chosen specifically so niche_level=0.5 reproduces the
+            # original validated floor of 0.3 EXACTLY - every prior test
+            # result in this project's debugging history was validated
+            # against that fixed value, so the slider's midpoint had to
+            # preserve it precisely rather than just being "close." Below
+            # 0.5, the floor rises toward 0.9 (popularity barely
+            # penalized, favors recognizable/mainstream results). Above
+            # 0.5, the floor falls toward 0.0 (full sensitivity to
+            # obscurity, favors deep cuts). This mapping has NOT been
+            # validated at its extremes the way 0.3 was - only the
+            # midpoint is proven; the endpoints are a reasonable-seeming
+            # extrapolation that should be checked against real output
+            # before being trusted.
+            if niche_level <= 0.5:
+                popularity_floor = 0.9 + (0.3 - 0.9) * (niche_level / 0.5)
+            else:
+                popularity_floor = 0.3 + (0.0 - 0.3) * ((niche_level - 0.5) / 0.5)
+
+            floored_percentile = popularity_floor + (1 - popularity_floor) * raw_popularity_percentile
             popularity_factor = floored_percentile**0.5
 
             candidate.final_score = candidate.tag_relevance * hop_distance_factor * popularity_factor

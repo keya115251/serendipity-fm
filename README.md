@@ -46,6 +46,13 @@ listener's dominant cluster plus any detected secondary clusters, and
 returns 7 diversity-capped recommendations, each with a suggested
 entry-point album.
 
+**Niche-ness slider** - a 0.0-1.0 control on how obscure recommendations
+skew, independent of how far (hop-wise) the walk wanders. Built on top
+of the already-validated popularity floor/dampen scoring mechanism
+rather than a new one - see [the niche-ness slider
+section](#the-niche-ness-slider) below for why that mechanism was chosen
+over two other real options that were considered and rejected.
+
 **Standalone artist/album lookup** (no account needed) - give one artist
 or album, get similar ones back. Useful for visitors without a Last.fm
 profile, or for a quick one-off "what's like this" question.
@@ -451,6 +458,59 @@ the proportionate choice here, not an oversight.
 
 </details>
 
+<a id="the-niche-ness-slider"></a>
+<details>
+<summary><strong>The niche-ness slider</strong></summary>
+
+How obscure should recommendations be, independent of how far the walk
+conceptually wanders (hop distance). These had been treated as the same
+thing earlier in this project's history, but they're not: a hop-2 result
+can be either extremely mainstream or extremely obscure depending on
+which path it took, so "niche-ness" needed its own dial.
+
+**Three real options were considered.** (1) Tune `min_listeners`
+directly - more intuitive to explain, but a hard cutoff, the same
+bluntness that caused the original 0-listener bug this project already
+fixed once; an artist would abruptly appear or vanish between slider
+notches rather than gently reordering. (2) Build a new blended composite
+score (popularity + hop distance + connectivity) - conceptually the most
+"correct," but exactly the kind of fresh, untested composite that's
+needed multiple real-data debugging rounds every other time it was tried
+in this project (see the cluster-fairness saga above). (3) Tune the
+existing popularity-factor floor (previously a fixed 0.3) - reuses a
+mechanism already proven to handle graduated, fair comparison (the
+Bayside case), at the cost of being a less intuitive lever to name to an
+end user.
+
+Went with option 3, on the reasoning that reusing validated machinery
+has a much better track record in this project than building new scoring
+logic from scratch, and the "needs an intuitive name" gap is a UI
+labeling problem, not a mechanism problem.
+
+**The mapping.** `niche_level` (0.0-1.0, default 0.5) maps to the
+popularity floor via a piecewise-linear function chosen so that 0.5
+reproduces the original validated floor of 0.3 EXACTLY - verified
+algebraically, not just approximately, since every prior debugging-
+history result in this project was tested against that specific value
+and changing it even slightly would have silently invalidated months of
+prior validation. Below 0.5 the floor rises toward 0.9 (popularity barely
+penalized); above 0.5 it falls toward 0.0 (full sensitivity to
+obscurity). Verified against a real profile at both extremes: at 0.0,
+results included PJ Harvey (2.2M listeners), The Cardigans (3.7M), and
+Lana Del Rey (5.3M); at 1.0, the same seeds produced Kingcrow (35K),
+Feline (50K), and MODyssey (18K) - a real, visible shift in the intended
+direction, with hop distance staying fixed at 2 throughout, confirming
+the two axes are genuinely independent rather than one quietly dragging
+the other.
+
+Only the midpoint (0.3) has the same depth of historical validation as
+the rest of this project's scoring formulas; the endpoints are a
+reasonable extrapolation of the same mechanism, checked once against one
+real profile, not independently proven the way 0.3 was across many test
+cases.
+
+</details>
+
 ## Tech stack
 
 Python, FastAPI (planned, for the deployed service layer), httpx (async
@@ -474,7 +534,7 @@ python -m tests.test_lastfm_client <username>
 python -m tests.test_taste_profile <username>
 python -m tests.test_artist_graph <username>
 python -m tests.test_artist_cache <artist_name>
-python -m tests.test_discovery_walk <username> [target_hop_distance] [max_depth] [max_hops]
+python -m tests.test_discovery_walk <username> [target_hop_distance] [max_depth] [max_hops] [niche_level]
 python -m tests.test_album_selection <artist_name> [<artist_name> ...]
 python -m tests.test_album_outliers <artist_name>
 python -m tests.test_lookup artist <artist_name>

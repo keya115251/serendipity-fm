@@ -5,12 +5,15 @@ detected outlier/secondary-cluster artists, see app/core/seeding.py),
 scores candidates using the same validated tag-relevance logic as outlier
 detection, and prints the top serendipitous recommendations.
 
-Run with: python -m tests.test_discovery_walk <username> [target_hop_distance] [max_depth] [max_hops]
+Run with: python -m tests.test_discovery_walk <username> [target_hop_distance] [max_depth] [max_hops] [niche_level]
 - target_hop_distance: scoring bias toward this depth (default 2)
 - max_depth: hard cap on how deep a recommendation can come from, even if
   the walk explored further (default: no extra filtering)
 - max_hops: how many hops the walk itself explores (default 3) - this was
   previously hardcoded and not actually configurable from outside the code
+- niche_level: 0.0-1.0, how obscure results should skew (default 0.5,
+  the original validated value - see DiscoveryWalk.score_candidates'
+  docstring for the mapping and why only the default is fully validated)
 """
 
 import asyncio
@@ -31,6 +34,7 @@ async def main(
     target_hop_distance: int = 2,
     max_depth: int | None = None,
     max_hops: int = 3,
+    niche_level: float = 0.5,
 ):
     client = LastFMClient()
     profile_builder = TasteProfileBuilder(client)
@@ -134,13 +138,14 @@ async def main(
             for artist, tag_weights in outlier_tag_results:
                 dominant_tags_by_seed[artist] = tag_weights
 
-        print(f"Scoring candidates (target_hop_distance={target_hop_distance}, max_depth={max_depth})...")
+        print(f"Scoring candidates (target_hop_distance={target_hop_distance}, max_depth={max_depth}, niche_level={niche_level})...")
         scored = await walk.score_candidates(
             candidates,
             dominant_tags_by_seed,
             target_hop_distance=target_hop_distance,
             max_depth=max_depth,
             previously_liked_artists=liked_artists,
+            niche_level=niche_level,
         )
 
         # Weight each outlier seed's allocation share by how much CURRENT
@@ -185,12 +190,20 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(
             "Usage: python -m tests.test_discovery_walk <username> "
-            "[target_hop_distance] [max_depth] [max_hops]"
+            "[target_hop_distance] [max_depth] [max_hops] [niche_level]\n"
+            "Pass the literal word None for max_depth to explicitly skip it "
+            "while still setting max_hops/niche_level, e.g.:\n"
+            "  python -m tests.test_discovery_walk myuser 2 None 3 0.0"
         )
         sys.exit(1)
+
+    def parse_optional_int(value: str) -> int | None:
+        return None if value.lower() == "none" else int(value)
+
     hop = int(sys.argv[2]) if len(sys.argv) > 2 else 2
-    depth = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    depth = parse_optional_int(sys.argv[3]) if len(sys.argv) > 3 else None
     hops = int(sys.argv[4]) if len(sys.argv) > 4 else 3
-    asyncio.run(main(sys.argv[1], hop, depth, hops))
+    niche = float(sys.argv[5]) if len(sys.argv) > 5 else 0.5
+    asyncio.run(main(sys.argv[1], hop, depth, hops, niche))
 
 
