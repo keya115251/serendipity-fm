@@ -61,6 +61,7 @@ class DiscoveryWalk:
         self,
         recommendations: list[WalkCandidate],
         dominant_tags_by_seed: dict[str, dict[str, float]] | None = None,
+        album_feedback: dict[tuple[str, str], str] | None = None,
     ) -> list[WalkCandidate]:
         """
         Fetches each recommendation's discography and assigns a suggested
@@ -80,6 +81,13 @@ class DiscoveryWalk:
         If dominant_tags_by_seed is omitted, falls back to
         pick_entry_point_album (pure popularity) - useful for callers that
         haven't built per-cluster tag profiles, or for quick smoke tests.
+
+        album_feedback, if given, is passed through to
+        pick_entry_point_album_with_tags to down-weight previously-
+        disliked album picks and boost previously-liked ones (see
+        app/db/feedback_store.py and that function's docstring). Has no
+        effect when dominant_tags_by_seed is omitted, since the plain
+        popularity-only selector doesn't currently consume feedback.
 
         Deliberately calls self.cache.client directly for both the
         discography and album-tag lookups, rather than going through a
@@ -109,7 +117,7 @@ class DiscoveryWalk:
 
             if cluster_tags:
                 entry_point = await pick_entry_point_album_with_tags(
-                    candidate.artist, albums, cluster_tags, fetch_album_tags
+                    candidate.artist, albums, cluster_tags, fetch_album_tags, album_feedback=album_feedback
                 )
             else:
                 entry_point = pick_entry_point_album(albums)
@@ -243,6 +251,7 @@ class DiscoveryWalk:
         hop_sigma: float = 1.0,
         min_listeners: int = 5000,
         max_depth: int | None = None,
+        previously_liked_artists: set[str] | None = None,
     ) -> list[WalkCandidate]:
         """
         Fetches tags + popularity for every candidate (concurrently, cache-
@@ -312,6 +321,17 @@ class DiscoveryWalk:
         bias scoring toward a target depth via target_hop_distance while
         still allowing deeper candidates through. None (default) applies
         no depth filtering beyond whatever expand() already walked.
+
+        previously_liked_artists, if given, applies a 0.6x down-weight
+        (i.e. final_score *= 0.4) to any candidate the user has
+        previously given explicit positive feedback on (see
+        app/db/feedback_store.py). These artists are deliberately NOT
+        excluded outright the way disliked artists are - down-weighting
+        keeps them reachable so a liked artist CAN still surface again
+        with a different suggested album (see
+        DiscoveryWalk.attach_entry_point_albums' album_feedback
+        parameter), which would be permanently unreachable if liked
+        artists were fully excluded from candidacy.
 
         POPULARITY NORMALIZATION IS PER-CLUSTER, not global. Real testing
         on a multi-cluster profile (prog/metal-dominant with a real
@@ -419,6 +439,20 @@ class DiscoveryWalk:
             popularity_factor = floored_percentile**0.5
 
             candidate.final_score = candidate.tag_relevance * hop_distance_factor * popularity_factor
+
+            # liked artists stay eligible (NOT excluded like disliked
+            # ones - see app/db/feedback_store.py), but are down-weighted
+            # since the listener has already heard them; a strong
+            # relevance match alone shouldn't outrank something genuinely
+            # new just because it happens to fit well. Kept reachable
+            # rather than excluded specifically so a liked artist CAN
+            # still resurface with a different album suggested via the
+            # album-feedback boost in attach_entry_point_albums - if
+            # liked artists were fully excluded, that boost would be
+            # permanently unreachable, which was a real design dead-end
+            # caught in testing before this version.
+            if previously_liked_artists and candidate.artist in previously_liked_artists:
+                candidate.final_score *= 0.4
             scored.append(candidate)
 
         return sorted(scored, key=lambda c: c.final_score, reverse=True)

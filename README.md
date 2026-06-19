@@ -3,31 +3,25 @@
 A music recommender built on Last.fm data that optimizes for genuine
 discovery rather than obvious similarity.
 
-## The problem with most recommenders
+Standard recommenders rank by predicted relevance alone, which converges
+on whatever's already popular and adjacent to a listener's taste - the
+five most famous, most-tagged-similar acts you'd have found anyway. This
+project optimizes for a second axis alongside relevance: unexpectedness.
+It walks a moderate distance away from a listener's dominant taste
+cluster instead of recommending from directly inside it, while still
+requiring a relevance floor so the result is discovery, not noise.
 
-Standard recommenders rank candidates by predicted relevance alone, which
-naturally converges on whatever is already popular and adjacent to a
-listener's existing taste. Ask a typical system what to listen to next
-based on an artist you love, and it hands back the five most famous,
-most-tagged-similar acts in that genre - things you'd have found anyway
-through radio, ads, or friends.
-
-This project optimizes for a second axis alongside relevance:
-unexpectedness. The core idea is to walk a moderate distance away from a
-listener's dominant taste cluster, rather than recommending from directly
-inside it, while still requiring a relevance floor so the result is
-discovery rather than noise.
+**Contents:** [Architecture](#architecture) ·
+[Features](#features) ·
+[Design decisions and debugging history](#design-decisions-and-debugging-history) ·
+[Tech stack](#tech-stack) · [Setup](#setup)
 
 ## Architecture
-
-The diagram above shows the two main paths through the system: a
-personalized pipeline that needs a Last.fm username, and a standalone
-artist/album lookup that doesn't. Module reference:
 
 | Module | Role |
 |---|---|
 | `app/core/lastfm_client.py` | Async Last.fm API wrapper, capped concurrency, retry on timeout |
-| `app/db/` | SQLite cache for artist info, tags, similarity edges |
+| `app/db/` | SQLite cache for artist info, tags, similarity edges, and per-user feedback |
 | `app/core/taste_profile.py` | Two-layer (12-month + recent) taste profile, outlier detection |
 | `app/core/artist_graph.py` | Similarity graph restricted to a user's own artists, connectivity scoring |
 | `app/core/tag_relevance.py` | Shared document-frequency-discounted tag relevance logic |
@@ -36,24 +30,71 @@ artist/album lookup that doesn't. Module reference:
 | `app/core/album_selection.py` | Dedup logic + entry-point album selection (plain and tag-aware) |
 | `app/core/album_outliers.py` | Album-level outlier detection - built, shelved, see below |
 | `app/core/lookup.py` | Standalone artist/album lookup, no Last.fm account needed |
+| `app/core/rediscover.py` | Surfaces a listener's old, dormant phases on purpose |
+| `app/db/feedback_store.py` | Per-user like/dislike feedback on recommended artists and albums |
 
 Full reasoning for each piece, including the real bugs found and fixed
-along the way, lives in the debugging sections below - this table is
+along the way, lives in [Design decisions and debugging
+history](#design-decisions-and-debugging-history) below - this table is
 just the map.
 
-## Why two taste layers, and why 12-month, not all-time
+## Features
+
+**The personalized discovery walk** (needs a Last.fm username) - the
+core feature. Builds a taste profile, seeds a graph walk from a
+listener's dominant cluster plus any detected secondary clusters, and
+returns 7 diversity-capped recommendations, each with a suggested
+entry-point album.
+
+**Standalone artist/album lookup** (no account needed) - give one artist
+or album, get similar ones back. Useful for visitors without a Last.fm
+profile, or for a quick one-off "what's like this" question.
+
+**Rediscover mode** - deliberately surfaces a listener's OLD, dormant
+phases: artists with a large all-time playcount but almost no plays in
+the last 12 months. The opposite of the rest of this project's "find
+something new" thesis - this is "remember this?" on purpose.
+
+**Feedback loop** - like or dislike a recommended artist or album.
+Disliked artists are excluded from future recommendations entirely;
+liked artists stay eligible but are down-weighted, and their tags get
+folded into future taste-shaping. Disliked albums are down-weighted in
+entry-point selection; liked albums get a small boost. Persisted per
+Last.fm username in a local SQLite table - see [the feedback loop
+section](#the-feedback-loop) below for why this design, not a simpler
+one, was the right call.
+
+**Album outlier detection** (built, shelved) - finds stylistically
+divergent albums within a single known artist's discography. Real
+testing kept surfacing cataloguing artifacts instead of genuine musical
+divergence; see [why it's shelved](#album-outlier-detection-shelved)
+below.
+
+## Design decisions and debugging history
+
+This project's README has historically documented real bugs and dead
+ends as they were found, not just the final working version - that
+history is preserved here, just collapsed by default so it doesn't bury
+the parts most worth reading first. Click any section to expand it.
+
+<details>
+<summary><strong>Why two taste layers, and why 12-month, not all-time</strong></summary>
 
 Last.fm's `overall` period reports all-time playcounts, which conflates
 genuinely stable current taste with phases a listener has since moved
 past entirely. In real testing, one test profile showed an artist with
 787 all-time plays but only 122 in the last 12 months - clearly a closed
-chapter, not part of current identity, yet `overall` weighted it almost as
-heavily as artists still in active rotation. Switching the long-term
-layer to the `12month` period fixed this directly. `overall` data is still
-worth using eventually for an explicit, opt-in "rediscover an old phase"
-mode, but it should never silently feed the default recommendation logic.
+chapter, not part of current identity, yet `overall` weighted it almost
+as heavily as artists still in active rotation. Switching the long-term
+layer to the `12month` period fixed this directly. `overall` data is
+still useful - it's now deliberately used by rediscover mode (see
+below) to surface exactly these old phases on purpose, but it should
+never silently feed the default recommendation logic.
 
-## Debugging the outlier detector
+</details>
+
+<details>
+<summary><strong>Debugging the outlier detector</strong></summary>
 
 This section exists because the actual debugging process here is more
 informative than the final result alone, and it's worth documenting
@@ -136,9 +177,12 @@ than one dense sub-group in this person's graph) would be a more precise
 answer and is a natural next step, but was deliberately deferred in favor
 of keeping the current two-signal design simple and shipped.
 
-## Debugging the discovery walk
+</details>
 
-Once the walk was built and producing real recommendations, two more
+<details>
+<summary><strong>Debugging the discovery walk</strong></summary>
+
+Once the walk was built and producing real recommendations, several
 rounds of testing against real, structurally different listener profiles
 surfaced problems that weren't visible from a single test case.
 
@@ -160,9 +204,8 @@ load-bearing node that fed several downstream recommendations. Two fixes
 were tried and discarded before adding full path-tracking (every
 candidate stores its complete seed-to-candidate chain, not just the
 immediate parent) made the actual problem visible and explainable rather
-than something to keep guessing at blind. This is logged as a known,
-accepted limitation rather than fully solved - see the "Tradeoffs" note
-below.
+than something to keep guessing at blind. Logged as a known, accepted
+limitation rather than fully solved - see Tradeoffs below.
 
 **The single-cluster seeding problem.** Tested against a second real
 profile that was prog-rock/metal-dominant by playcount but had a genuine
@@ -177,68 +220,66 @@ artists crack the top N by raw playcount.
 
 **The single-dominant-tags problem.** Diversifying seeds didn't change
 the final output at all, which was the signal something else was wrong.
-The cause: every candidate, regardless of which seed it came from, was
-still scored against ONE global dominant-tag profile - which, for a
-prog/metal-dominant listener, was overwhelmingly prog/metal. A candidate
-discovered via the My Chemical Romance seed was being asked "does this
-fit the listener's overall aggregate taste" instead of "does this fit the
-MCR-adjacent cluster specifically," and structurally lost every time.
-Fixed by scoring each candidate against its OWN originating cluster's tag
-profile (the global profile for primary seeds, that artist's own tags for
-outlier seeds), using `candidate.path[0]` to know which cluster a
-candidate actually came from.
+Every candidate, regardless of which seed it came from, was still scored
+against ONE global dominant-tag profile - overwhelmingly prog/metal for
+that listener. A candidate discovered via the My Chemical Romance seed
+was being asked "does this fit the listener's overall aggregate taste"
+instead of "does this fit the MCR-adjacent cluster specifically," and
+structurally lost every time. Fixed by scoring each candidate against its
+OWN originating cluster's tag profile (the global profile for primary
+seeds, that artist's own tags for outlier seeds), using
+`candidate.path[0]` to know which cluster a candidate actually came from.
 
 **The cross-cluster popularity problem.** Cluster-aware tag scoring
 fixed relevance, but emo-cluster candidates were still losing to
 prog-cluster ones, because pop-punk/emo as a genre simply has more
-mainstream-popular acts (millions of listeners) than underground prog
-does - so even a great-fitting emo candidate (Bayside, the strongest tag
-match in its cluster) was scoring far below niche prog candidates purely
-on an absolute popularity scale that didn't mean the same thing across
-genres. First attempted percentile-rank-within-cluster (same principle as
-the connectivity-score fix from outlier detection), but this just
-relocated the unfairness: the single most-mainstream member of any
-cluster gets a raw percentile of 0 regardless of how well it fits,
-zeroing out its score entirely. The actual fix combined a floor (a
-candidate's popularity contribution can never go below 30% regardless of
-percentile) with a dampening exponent (square root) on the remainder, so
-popularity differentiates between similar-fit candidates without being
-able to override a genuinely strong tag match. Verified directly: Bayside
-went from not appearing in the top 10 at all, to scoring 4th overall,
-ahead of three of the five prog/metal candidates that previously
-dominated the list outright.
+mainstream-popular acts than underground prog does - so even a
+great-fitting emo candidate (Bayside, the strongest tag match in its
+cluster) scored far below niche prog candidates purely on an absolute
+popularity scale that didn't mean the same thing across genres. First
+attempted percentile-rank-within-cluster, but this just relocated the
+unfairness: the single most-mainstream member of any cluster gets a raw
+percentile of 0 regardless of fit, zeroing out its score entirely. The
+actual fix combined a floor (popularity contribution can never go below
+30%) with a dampening exponent (square root) on the remainder. Verified
+directly: Bayside went from absent in the top 10 to scoring 4th overall.
 
 **The outlier-dominance problem.** Fixing cross-cluster fairness swung
-the bias the other way for a different profile: a listener whose primary
-cluster was alt/indie, with two detected outlier seeds (a K-pop group and
-a prog rock act), ended up with 4 of the top 5 recommendations being
-K-pop - the outlier cluster's candidates happened to sit at a more
-favorable point in their own narrow popularity distribution, and nothing
-in the scoring pipeline capped how much of the final output any one
-cluster could claim. Added `diversify_top_n`: a cap on max recommendations
-per cluster, plus a guarantee that every cluster with a viable candidate
-gets at least one slot (so a weak-but-real secondary cluster can't
-silently drop to zero just because it scored worse that particular run -
-the same failure outlier seeding was built to prevent in the first place,
-just resurfacing one stage later). This still wasn't quite right on its
-own: every detected outlier was getting the identical guaranteed slot and
-up-to-3 ceiling regardless of how much actual CURRENT signal it
-represented. For one listener, the K-pop outlier was almost entirely
-historical (the same stale-history pattern documented above - 787
-all-time plays, only 122 in the last 12 months), yet it received the same
-allocation as an outlier the listener still actively engaged with. Final
-fix: each outlier's slot allocation is now scaled by its 12-month
-playcount relative to the listener's most-played artist, and a cluster
-below a minimum relevance threshold loses the guarantee entirely (though
-it can still earn slots on pure score merit). The near-dormant K-pop
-cluster went from 2 of 7 final recommendations down to 1, while a more
-active secondary cluster in the same run kept its full guaranteed slot.
+the bias the other way for a different profile: a listener with two
+detected outlier seeds (K-pop and prog rock) ended up with 4 of the top
+5 recommendations being K-pop, since that cluster's candidates happened
+to sit at a favorable point in their own narrow popularity distribution
+and nothing capped how much of the output any one cluster could claim.
+Added `diversify_top_n`: a cap on max recommendations per cluster, plus
+a guarantee that every cluster with a viable candidate gets at least one
+slot. This still wasn't quite right alone - every detected outlier got
+the identical guaranteed slot and ceiling regardless of how much CURRENT
+signal it represented. A near-dormant K-pop outlier (787 all-time plays,
+122 in the last 12 months) received the same allocation as an outlier
+the listener still actively engaged with. Final fix: each outlier's slot
+allocation is now scaled by its 12-month playcount relative to the
+listener's most-played artist, and a cluster below a minimum relevance
+threshold loses the guarantee entirely. The near-dormant cluster went
+from 2 of 7 final recommendations to 1.
 
-## Debugging album selection
+**Tradeoffs accepted rather than further chased.** A candidate reachable
+from more than one seed only keeps the first path encountered during
+traversal, order-dependent rather than necessarily "the most meaningful"
+path - a real simplification, not a fully solved design. The weak-seed
+problem is mitigated by path visibility, not eliminated. The diversity
+cap operates at the seed-cluster level only - two final recommendations
+from the same primary cluster can still share the same hop-1
+intermediate bridge artist, the same one-branch-dominating pattern
+recurring at a smaller scale, not yet addressed.
+
+</details>
+
+<details>
+<summary><strong>Debugging album selection</strong></summary>
 
 Once the discovery walk was producing solid artist recommendations, the
 next question was obvious: recommend an artist, sure, but where should a
-listener actually start? Real testing against artist.getTopAlbums
+listener actually start? Real testing against `artist.getTopAlbums`
 exposed why "just take the highest-playcount album" doesn't work.
 
 **Shared-mbid duplicates.** Hozier's self-titled debut, its Expanded
@@ -246,40 +287,32 @@ Edition, and its Special Edition are catalogued as separate rows.
 Expanded and Special share one MusicBrainz ID; the plain edition has a
 DIFFERENT one - so grouping by mbid alone under-merges, splitting one
 real album into two competing groups. Switched to grouping by
-edition-suffix-stripped name as the primary key instead, with mbid no
-longer load-bearing for this specific purpose.
+edition-suffix-stripped name as the primary key instead.
 
 **Picking the wrong representative within a group.** Even after correct
 grouping, naively taking the highest-individual-playcount row within the
 winning group returned "Hozier (Expanded Edition)" instead of plain
-"Hozier" - a more confusing entry point than the original release, even
-though the math correctly identified WHICH album won. Fixed by preferring
-a plain, no-suffix entry within the winning group whenever one exists.
+"Hozier." Fixed by preferring a plain, no-suffix entry within the
+winning group whenever one exists.
 
 **Small-artist punctuation fragmentation.** A niche artist's debut album
 was catalogued as four near-identical spellings ("1.Got Hooked: An
-Addictive Symphony", "1. Got Hooked: An Addictive Symphony - EP", with
-and without a leading "1.", with and without a space after the period) -
-none of which are "edition" variants the suffix regex understands, just
-inconsistent manual data entry. This happened to not change the outcome
-in initial testing (one entry was dominant enough to win regardless), but
-a more evenly-split case could have under-counted the real album's
-popularity. Added a second, fuzzy-string-similarity merge pass
-(`difflib.SequenceMatcher` against aggressively punctuation-stripped
-names) specifically to catch this class of fragmentation that exact
-matching can't.
+Addictive Symphony", with and without a leading "1.", with and without a
+space after the period) - none of which are "edition" variants the
+suffix regex understands, just inconsistent manual data entry. Added a
+second, fuzzy-string-similarity merge pass (`difflib.SequenceMatcher`
+against punctuation-stripped names) to catch this class of fragmentation
+that exact matching can't.
 
-**Tag-aware selection, and why pure popularity isn't always right
-either.** An artist gets recommended because they matched a specific
-taste cluster, but their single most popular album might not be their
-most representative one for THAT match - an artist with real stylistic
-range across their discography could have a more mainstream album that
-doesn't actually sound like why they surfaced in the first place. Added
+**Tag-aware selection.** An artist gets recommended because they matched
+a specific taste cluster, but their single most popular album might not
+be their most representative one for THAT match. Added
 `pick_entry_point_album_with_tags`: among an artist's top few albums by
-combined playcount (after the same dedup), score each against the SAME
-per-cluster dominant tags used to score the artist recommendation itself,
-blending tag fit with popularity rather than using either alone.
+combined playcount, score each against the SAME per-cluster dominant
+tags used to score the artist recommendation itself, blending tag fit
+with popularity rather than using either alone.
 
+<a id="album-outlier-detection-shelved"></a>
 **Album-level outlier detection, and why it's shelved.** Tried extending
 the same outlier-detection thesis one level down - finding stylistically
 divergent albums within a single known artist's own discography. Real
@@ -288,25 +321,25 @@ positives that turned out to be cataloguing artifacts, not genuine
 musical divergence: albums with 0-1 tags scoring a flat 0.0 relevance
 purely from lacking data (fixed with a minimum-tag-count eligibility
 gate); deluxe/extended-tracklist entries like "Unreal Unearth: Unheard"
-and "Unreal Unearth: Unending" that needed a colon-subtitle merging
-heuristic on top of the existing dedup (added, but deliberately scoped
-to album-outlier detection only, NOT applied to entry-point selection,
+that needed a colon-subtitle merging heuristic on top of the existing
+dedup (scoped to outlier detection only, not entry-point selection,
 since the over-merge risk is acceptable in one context and not the
 other); and finally, albums that were neither pre-release singles nor
 deluxe editions but post-release marketing repackagings (the same
-tracklist resold as a separate "album" with one extra song, a sales
-tactic, not a cataloguing edition) - which slipped past every fix above
-because they have genuinely real, if sparse, independent tag data. With
-no album-level equivalent of artist.getSimilar to use as a second,
-independent validating signal (the thing that made artist-level outlier
-detection actually trustworthy), and a real catalogue-data ceiling that
-kept producing artifacts rather than genuine discoveries no matter how
-many heuristics were added, this mode is shelved rather than shipped -
-the dedup infrastructure it shares with entry-point selection is real and
-useful, but the outlier-detection feature itself isn't considered
-production-ready.
+tracklist resold as a separate "album" with one extra song) - which
+slipped past every fix above because they have genuinely real, if
+sparse, independent tag data. With no album-level equivalent of
+`artist.getSimilar` to use as a second, independent validating signal,
+and a real catalogue-data ceiling that kept producing artifacts no
+matter how many heuristics were added, this mode is shelved rather than
+shipped. The dedup infrastructure it shares with entry-point selection
+is real and useful; the outlier-detection feature itself isn't
+considered production-ready.
 
-## Debugging the standalone lookup feature
+</details>
+
+<details>
+<summary><strong>Debugging the standalone lookup feature</strong></summary>
 
 Built for visitors without a Last.fm account: give one artist or album,
 get similar ones back, no profile or taste cluster involved. Reuses
@@ -321,25 +354,20 @@ regex required its keyword to appear immediately after the opening
 bracket, so "(The 10th Anniversary Edition)" - with "The" in between -
 didn't match at all; broadened the pattern to allow leading words before
 the keyword. Second, even after that fix, what remained was a
-slash-compound title ("The Black Parade / Living With Ghosts") that
-still didn't match the plain "The Black Parade" group by name. Rather
-than keep special-casing title formats, added a content-based merge
-instead: two same-artist albums with very high tag overlap (90%+) AND an
-edition keyword present in one of the original names get merged,
-regardless of how the title is structured. The keyword requirement
-guards against the real risk that two genuinely different albums can
-share high tag overlap just from an artist's style being consistent
-across their discography.
+slash-compound title that still didn't match the plain "The Black
+Parade" group by name. Rather than keep special-casing title formats,
+added a content-based merge instead: two same-artist albums with very
+high tag overlap (90%+) AND an edition keyword present in one of the
+original names get merged, regardless of how the title is structured.
 
 **Artist similarity outweighing actual sound.** Initial scoring (0.4
 artist-similarity, 0.6 tag-overlap) let "Stomachaches" by Frank Iero (an
 MCR member's solo project, high artist-similarity but only 40% tag
 overlap) outscore "Infinity on High" by Fall Out Boy (lower
 artist-similarity but a real, comparable tag match) - "this person was
-in the band" was carrying more weight than whether the music actually
-sounds similar. Reweighted to 0.3/0.7 in favor of tag overlap; verified
-against the real scores from this exact case that the ordering flips
-correctly.
+in the band" carried more weight than whether the music actually sounds
+similar. Reweighted to 0.3/0.7 in favor of tag overlap; verified against
+the real scores from this exact case that the ordering flips correctly.
 
 **Diversity cap needed a guarantee, not just a ceiling.** A cap of 2
 albums per artist still let MCR, Gerard Way, and The Used fill 6 of 7
@@ -347,28 +375,87 @@ results - the same cap-without-guarantee gap already learned from
 `diversify_top_n`. Lowered to 1 per artist so every result is a
 different act.
 
-**Tradeoffs accepted rather than further chased.** A candidate reachable
-from more than one seed only keeps the FIRST path encountered during
-traversal, which is order-dependent rather than necessarily "the most
-meaningful" path - this is a real simplification, not a fully solved
-design. The weak-seed problem (load-bearing via-artists a listener barely
-knows) is mitigated by path visibility, not eliminated; a real fix would
-likely need per-hop relevance weighting keyed to something other than
-aggregate tag similarity, which was tried once, didn't change results,
-and was deprioritized in favor of the bigger, more clearly-broken
-cluster-fairness issues above. Separately, the diversity cap operates at
-the seed-cluster level only - two final recommendations from the same
-primary cluster can still share the same hop-1 intermediate artist (e.g.
-both reached via the same bridge artist), which is the same
-one-branch-dominating pattern recurring at a smaller scale within a
-single cluster, not yet addressed.
+</details>
+
+<details>
+<summary><strong>Rediscover mode</strong></summary>
+
+The rest of this project deliberately uses 12-month playcount instead of
+`overall` for the default taste profile, because `overall` conflates
+genuinely current taste with closed chapters (see "Why two taste
+layers" above). Rediscover mode does the opposite on purpose: it finds
+artists with a real `overall` playcount but only a small fraction of
+that in the last 12 months, and surfaces them directly, no walk, no new
+discovery, just "remember this?"
+
+Built as a thin module (`app/core/rediscover.py`) that calls
+`LastFMClient.get_top_artists` for both periods directly, rather than
+going through the full `TasteProfileBuilder` - that builder also fetches
+per-artist tags and builds a similarity graph for outlier detection,
+none of which this feature needs, so the simpler, cheaper version was
+built from the start rather than optimized later.
+
+**A real edge case, deliberately left alone.** Testing against a real
+profile flagged Hozier as an "old phase" (1221 all-time plays, 151 in
+the last 12 months, a 0.124 ratio) despite Hozier also being that
+listener's single biggest *current* 12-month artist - both things can be
+true at once when an artist has a long enough history. The fix under
+consideration was excluding any artist still in the user's current top N
+from rediscover results regardless of ratio, but the listener's own
+judgment ("I haven't been listening to Hozier much this year") was a
+better signal than anything the ratio math could provide, so this was
+deliberately left as a known characteristic rather than patched.
+
+</details>
+
+<a id="the-feedback-loop"></a>
+<details>
+<summary><strong>The feedback loop</strong></summary>
+
+Lets a listener like or dislike a recommended artist or album, persisted
+in a new SQLite table (`app/db/feedback_store.py`, `UserFeedback` in
+`app/db/models.py`) keyed by Last.fm username - the natural identity key
+already used everywhere else in this project, since there's no separate
+account system.
+
+**The rule, once it was actually worked out.** Disliked artists are
+excluded entirely from future recommendations (folded into
+`known_artists` at walk time, same as an artist the listener already
+listens to). Liked artists stay eligible to be recommended again, but
+are down-weighted in scoring (`final_score *= 0.4`) rather than excluded.
+Disliked albums are down-weighted in entry-point selection, not
+excluded - disliking one album shouldn't blacklist the whole artist.
+Liked albums get a small boost. Separately, a liked artist's tags get
+folded into the dominant tag profile with a modest weight, shaping what
+OTHER candidates look appealing.
+
+**A real design dead-end, caught before shipping.** The first version
+excluded BOTH liked and disliked artists from `known_artists`, on the
+reasoning that any artist with feedback (either direction) has already
+been heard and shouldn't resurface as a "new" discovery. This created a
+dead end: the album-feedback boost (push a liked artist's OTHER albums
+harder) could never actually fire, since an excluded artist can never
+reach the entry-point-selection step in the first place. Corrected to
+the rule above - only disliked artists are excluded outright; liked
+artists stay reachable specifically so the album-level boost has
+something to apply to if the artist resurfaces with a different
+suggested album.
+
+**Why this is synchronous, not async like the rest of the cache
+layer.** `ArtistDataCache` is fully async with a semaphore, built to
+handle the discovery walk's high-fanout concurrent fetching (dozens of
+simultaneous Last.fm calls per hop). Feedback reads/writes are
+low-frequency, user-initiated actions (a single click), not a workload
+that needs that complexity - a plain synchronous SQLAlchemy session is
+the proportionate choice here, not an oversight.
+
+</details>
 
 ## Tech stack
 
 Python, FastAPI (planned, for the deployed service layer), httpx (async
 Last.fm client), networkx (similarity graph + walk traversal), SQLAlchemy
-+ SQLite (persistent artist-graph/tag/info cache), scikit-learn (planned,
-for the content-embedding side of the hybrid recommendation engine).
++ SQLite (artist-graph/tag/info cache, plus per-user feedback storage).
 
 ## Setup
 
@@ -392,15 +479,19 @@ python -m tests.test_album_selection <artist_name> [<artist_name> ...]
 python -m tests.test_album_outliers <artist_name>
 python -m tests.test_lookup artist <artist_name>
 python -m tests.test_lookup album <artist_name> <album_name>
+python -m tests.test_rediscover <username>
+python -m tests.test_feedback artist <username> <artist_name> <liked|disliked>
+python -m tests.test_feedback album <username> <artist_name> <album_name> <liked|disliked>
+python -m tests.test_feedback show <username>
 ```
 
 `test_discovery_walk` is the main end-to-end test: builds a real taste
 profile, seeds the walk from top artists plus any detected outliers,
 expands through the cached similarity graph, scores and diversity-caps
 the results, and attaches a suggested entry-point album to each final
-recommendation. `test_album_outliers` exercises the shelved album-outlier
-mode (see "Debugging album selection" above) - functional, but not
-considered production-ready.
+recommendation - now also factoring in any recorded like/dislike
+feedback for that username. `test_album_outliers` exercises the shelved
+album-outlier mode - functional, but not considered production-ready.
 
 See `tests/debug/README.md` for the diagnostic scripts referenced in the
-debugging narrative above.
+debugging history above.

@@ -268,6 +268,7 @@ async def pick_entry_point_album_with_tags(
     fetch_album_tags,
     consider_top_n: int = 4,
     tag_weight: float = 0.6,
+    album_feedback: dict[tuple[str, str], str] | None = None,
 ) -> dict | None:
     """
     Tag-aware version of pick_entry_point_album: among an artist's most
@@ -298,6 +299,17 @@ async def pick_entry_point_album_with_tags(
     candidate in the considered set (so the most popular one always
     scores 1.0 on that axis, not an arbitrary absolute number).
 
+    album_feedback, if given, maps (artist_name, album_name) -> "liked"
+    or "disliked" (see app/db/feedback_store.py - the keys are the user's
+    PAST feedback on albums they've previously seen). A disliked candidate
+    is down-weighted (multiplied by 0.5), NOT excluded outright - the
+    feedback loop's design treats disliked ALBUMS as a steer-away signal,
+    not a full block, unlike disliked ARTISTS which ARE fully excluded at
+    the discovery-walk level (see DiscoveryWalk / FeedbackStore docstrings
+    for that distinction). A liked candidate gets a small boost (×1.15).
+    This only affects candidates the user has actually voted on before -
+    everything else is scored exactly as it would be without feedback.
+
     fetch_album_tags is an async callable: (artist_name, album_name) ->
     list[{"tag": str, "count": int}], matching LastFMClient.get_album_info
     or an equivalent cache-backed wrapper. Injected as a parameter rather
@@ -311,6 +323,8 @@ async def pick_entry_point_album_with_tags(
     """
     if not albums:
         return None
+
+    album_feedback = album_feedback or {}
 
     groups = deduped_album_groups(albums)
     if not dominant_tags:
@@ -338,10 +352,17 @@ async def pick_entry_point_album_with_tags(
         best_group = max(groups.values(), key=lambda group: sum(a["playcount"] for a in group))
         return representative_for_group(best_group)
 
-    def combined_score(relevance: float, playcount: int) -> float:
+    def combined_score(rep: dict, relevance: float, playcount: int) -> float:
         popularity_score = playcount / max_playcount
         tag_score = relevance / max_relevance
-        return (1 - tag_weight) * popularity_score + tag_weight * tag_score
+        score = (1 - tag_weight) * popularity_score + tag_weight * tag_score
 
-    best = max(scored, key=lambda triple: combined_score(triple[1], triple[2]))
+        sentiment = album_feedback.get((artist_name, rep["name"]))
+        if sentiment == "disliked":
+            score *= 0.5
+        elif sentiment == "liked":
+            score *= 1.15
+        return score
+
+    best = max(scored, key=lambda triple: combined_score(triple[0], triple[1], triple[2]))
     return best[0]
