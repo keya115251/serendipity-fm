@@ -147,7 +147,16 @@ async def find_similar_albums(
         # title format Last.fm's catalogue uses (see
         # merge_high_tag_overlap_editions docstring for the real case -
         # a slash-compound anniversary-edition title - that motivated this)
-        async def fetch_group_tags(group_key: str, group: list[dict]):
+        # ca=ca forces EARLY binding instead of Python's default late
+        # binding for closures - this happens to work correctly TODAY
+        # since the inner asyncio.gather below resolves before the outer
+        # loop advances to the next artist, but it's the exact same
+        # fragile pattern that caused a real bug in the multi-artist
+        # version of this logic (app/core/multi_album.py) once multiple
+        # artists' fetches needed to be concurrent with each other, not
+        # just within one artist's own processing. Fixed proactively here
+        # rather than waiting for a refactor to break it the same way.
+        async def fetch_group_tags(group_key: str, group: list[dict], ca=ca):
             top_in_group = max(group, key=lambda a: a["playcount"])
             tags = set(await fetch_album_tags(ca["name"], top_in_group["name"]))
             return group_key, tags

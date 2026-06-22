@@ -32,6 +32,8 @@ requiring a relevance floor so the result is discovery, not noise.
 | `app/core/lookup.py` | Standalone artist/album lookup, no Last.fm account needed |
 | `app/core/rediscover.py` | Surfaces a listener's old, dormant phases on purpose |
 | `app/db/feedback_store.py` | Per-user like/dislike feedback on recommended artists and albums |
+| `app/core/multi_seed.py` | No-account discovery walk seeded from up to 7 user-given artists |
+| `app/core/multi_album.py` | No-account album recommendations from up to 7 user-given albums |
 
 Full reasoning for each piece, including the real bugs found and fixed
 along the way, lives in [Design decisions and debugging
@@ -53,9 +55,32 @@ rather than a new one - see [the niche-ness slider
 section](#the-niche-ness-slider) below for why that mechanism was chosen
 over two other real options that were considered and rejected.
 
-**Standalone artist/album lookup** (no account needed) - give one artist
-or album, get similar ones back. Useful for visitors without a Last.fm
-profile, or for a quick one-off "what's like this" question.
+**Multi-artist input** (no account needed) - give up to 7 artists
+directly, get recommendations seeded from all of them at once. Reuses
+the full discovery walk machinery (cluster-aware scoring, diversity cap,
+niche-ness slider, entry-point albums) with the 7 artists as equal-
+status seeds, no outlier detection step since all inputs are explicitly
+chosen rather than inferred from listening history.
+
+**Multi-album input** (no account needed) - give up to 7 albums
+directly (as artist::album pairs), get similar albums back. Combines all
+7 seed albums' tags into one shared signature and scores candidates
+against that union, rather than treating each seed album independently.
+Seed artists' own other albums are excluded from results on the
+reasoning that someone offering an album as a taste signal has very
+likely already explored that artist's discography. See [debugging the
+multi-album input](#debugging-the-multi-album-input) below for two real
+bugs found during initial testing.
+
+**Multi-artist / multi-album input** (no account needed) - give up to 7
+artists or up to 7 albums directly, get real discovery-walk-quality
+recommendations back without needing a Last.fm profile at all. Built on
+the same validated mechanisms as the personalized features (the
+discovery walk for artists, lookup.py's tag+artist-similarity scoring
+for albums) rather than separate, simpler logic - see [the multi-input
+section](#multi-input-no-account-needed) below for the real bugs this
+surfaced, including one that was quietly present in the original
+single-album lookup too.
 
 **Rediscover mode** - deliberately surfaces a listener's OLD, dormant
 phases: artists with a large all-time playcount but almost no plays in
@@ -511,6 +536,40 @@ cases.
 
 </details>
 
+<a id="debugging-the-multi-album-input"></a>
+<details>
+<summary><strong>Debugging the multi-album input</strong></summary>
+
+The first real test run with 3 seed albums surfaced two bugs immediately.
+
+**Every result came from the 3 seed artists' own discographies.** Root
+cause: a classic Python late-binding closure bug inside a loop. The
+`fetch_group_tags` inner function captured `artist_name` as a free
+variable from the enclosing loop - by reference, not by value. Since
+`asyncio.gather` runs all closures concurrently AFTER the loop has
+already finished advancing, every closure was silently using whichever
+`artist_name` happened to be LAST, corrupting tag data for every
+similar-artist candidate. They all scored poorly and were filtered out,
+while only the seed artists (processed separately with correct scoping)
+survived. Fixed by binding `artist_name` as a default argument
+(`artist_name=artist_name`), forcing early binding at closure-creation
+time. The same fragile pattern was found and proactively fixed in
+`lookup.py`'s single-album version too, where it happened to work
+correctly by accident of execution order but was one refactor away from
+the same failure.
+
+**A seed album recommended itself back.** "Riot!" (typed by the user)
+was recommended back as "RIOT!" because Last.fm's autocorrect resolved
+the input to its actual catalogue capitalization, but the exact-string
+seed-exclusion check compared against the raw user input, and the
+mismatch slipped through. Rather than patch name-matching to handle
+capitalization, seed artists' own albums are now excluded from the
+candidate pool entirely upstream - fixing the self-recommendation bug
+and the "seed artists' other albums are lower-value than fresh
+discoveries" design concern at the same time.
+
+</details>
+
 ## Tech stack
 
 Python, FastAPI (planned, for the deployed service layer), httpx (async
@@ -543,6 +602,8 @@ python -m tests.test_rediscover <username>
 python -m tests.test_feedback artist <username> <artist_name> <liked|disliked>
 python -m tests.test_feedback album <username> <artist_name> <album_name> <liked|disliked>
 python -m tests.test_feedback show <username>
+python -m tests.test_multi_seed <artist1> <artist2> ... (up to 7) [--niche 0.0-1.0]
+python -m tests.test_multi_album "Artist1::Album1" "Artist2::Album2" ... (up to 7)
 ```
 
 `test_discovery_walk` is the main end-to-end test: builds a real taste
